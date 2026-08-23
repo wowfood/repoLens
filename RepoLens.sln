@@ -1,0 +1,28 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RepoLens", "RepoLens\RepoLens.csproj", "{00FF4AD3-2E2B-45C3-96E2-634C00697C50}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RepoLens.Api", "RepoLens.Api\RepoLens.Api.csproj", "{9F018AAA-A2AE-4F83-8909-167E53A8C452}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DevContext.Tests", "RepoLens.Tests\DevContext.Tests.csproj", "{C4632DC7-CAC5-4C7D-A0DD-258066CDFD09}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{00FF4AD3-2E2B-45C3-96E2-634C00697C50}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{00FF4AD3-2E2B-45C3-96E2-634C00697C50}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{00FF4AD3-2E2B-45C3-96E2-634C00697C50}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{00FF4AD3-2E2B-45C3-96E2-634C00697C50}.Release|Any CPU.Build.0 = Release|Any CPU
+		{9F018AAA-A2AE-4F83-8909-167E53A8C452}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{9F018AAA-A2AE-4F83-8909-167E53A8C452}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{9F018AAA-A2AE-4F83-8909-167E53A8C452}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{9F018AAA-A2AE-4F83-8909-167E53A8C452}.Release|Any CPU.Build.0 = Release|Any CPU
+		{C4632DC7-CAC5-4C7D-A0DD-258066CDFD09}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C4632DC7-CAC5-4C7D-A0DD-258066CDFD09}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C4632DC7-CAC5-4C7D-A0DD-258066CDFD09}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C4632DC7-CAC5-4C7D-A0DD-258066CDFD09}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

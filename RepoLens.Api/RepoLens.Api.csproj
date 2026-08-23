@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net8.0</TargetFramework>
+        <AssemblyName>RepoLens.Api</AssemblyName>
+        <RootNamespace>DevContext</RootNamespace>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+        <PackageId>RepoLens.Api</PackageId>
+        <Version>0.7.0</Version>
+        <Description>Reusable deterministic repository analysis, baselines, affected-code discovery, and verification for .NET applications.</Description>
+        <PackageLicenseExpression>MIT</PackageLicenseExpression>
+        <Authors>RepoLens contributors</Authors>
+        <PackageTags>dotnet;repository-analysis;roslyn;developer-tools;api</PackageTags>
+        <IncludeSymbols>true</IncludeSymbols>
+        <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+        <Deterministic>true</Deterministic>
+        <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+        <PackageReadmeFile>docs/repolens-api.md</PackageReadmeFile>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <Compile Include="..\RepoLens\Configuration\**\*.cs" Link="Configuration\%(RecursiveDir)%(Filename)%(Extension)" />
+        <Compile Include="..\RepoLens\Core\**\*.cs" Link="Core\%(RecursiveDir)%(Filename)%(Extension)" />
+        <Compile Include="..\RepoLens\Infrastructure\**\*.cs" Link="Infrastructure\%(RecursiveDir)%(Filename)%(Extension)" />
+        <Compile Include="..\RepoLens\Services\**\*.cs" Link="Services\%(RecursiveDir)%(Filename)%(Extension)" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.13.0" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <None Include="..\RepoLens\docs\repolens-api.md" Pack="true" PackagePath="docs/repolens-api.md" />
+        <None Include="..\LICENSE" Pack="true" PackagePath="" />
+    </ItemGroup>
+
+</Project>

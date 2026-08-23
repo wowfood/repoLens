@@ -1,0 +1,42 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
+        <AssemblyName>dev-context</AssemblyName>
+        <RootNamespace>DevContext</RootNamespace>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+        <PackAsTool>true</PackAsTool>
+        <ToolCommandName>dev-context</ToolCommandName>
+        <PackageId>DevContext.Cli</PackageId>
+        <Version>0.7.0</Version>
+        <Description>Deterministic repository baselines and regression verification for .NET coding tasks.</Description>
+        <PackageLicenseExpression>MIT</PackageLicenseExpression>
+        <Authors>RepoLens contributors</Authors>
+        <PackageTags>dotnet;tool;repository-analysis;roslyn;developer-tools</PackageTags>
+        <IncludeSymbols>true</IncludeSymbols>
+        <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+        <Deterministic>true</Deterministic>
+        <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+        <PackageReadmeFile>docs/dev-context-cli.md</PackageReadmeFile>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <Compile Remove="Configuration\**\*.cs" />
+        <Compile Remove="Core\**\*.cs" />
+        <Compile Remove="Infrastructure\**\*.cs" />
+        <Compile Remove="Services\**\*.cs" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\RepoLens.Api\RepoLens.Api.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <None Update="docs/dev-context-cli.md" Pack="true" PackagePath="docs/dev-context-cli.md" />
+        <None Include="..\LICENSE" Pack="true" PackagePath="" />
+    </ItemGroup>
+
+</Project>

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Repository Baseline"
+  short_description: "Baseline and verify coding tasks with dev-context"
+  default_prompt: "Use $dev-context-baseline to capture deterministic repository context before coding and verify only this task's regressions."
+
+policy:
+  allow_implicit_invocation: false

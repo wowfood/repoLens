@@ -1,0 +1,102 @@
+[
+  {
+    "name": "evidence token budget",
+    "query": "evidence query token budget selection reasons",
+    "expectedFiles": [
+      "RepoLens/Services/EvidenceQueryService.cs",
+      "RepoLens.Tests/ApiIntegrationTests.cs",
+      "RepoLens.Tests/CliArgumentsTests.cs",
+      "RepoLens/Core/Models.cs"
+    ],
+    "expectedRelationships": [],
+    "maxTokens": 1800,
+    "maxResults": 8,
+    "graphDepth": 1
+  },
+  {
+    "name": "per-target references",
+    "query": "resolve project references independently for each target framework",
+    "expectedFiles": [
+      "RepoLens/Services/ProjectIndexer.cs",
+      "RepoLens.Tests/ProjectIndexerTests.cs",
+      "RepoLens/Core/Models.cs"
+    ],
+    "expectedRelationships": [],
+    "maxTokens": 1800,
+    "maxResults": 8,
+    "graphDepth": 1
+  },
+  {
+    "name": "source generators",
+    "query": "execute source generators and index generated source files",
+    "expectedFiles": [
+      "RepoLens/Services/SymbolIndexer.cs",
+      "RepoLens.Tests/RepositoryAndSymbolTests.cs",
+      "RepoLens/Configuration/DevContextConfig.cs",
+      "RepoLens/Core/Models.cs"
+    ],
+    "expectedRelationships": [],
+    "maxTokens": 1800,
+    "maxResults": 8,
+    "graphDepth": 1
+  },
+  {
+    "name": "desktop markup",
+    "query": "Razor XAML markup binding event component relationships",
+    "expectedFiles": ["RepoLens/Services/MarkupIndexer.cs"],
+    "expectedRelationships": [],
+    "maxTokens": 1800,
+    "maxResults": 8,
+    "graphDepth": 1
+  },
+  {
+    "name": "public benchmark API",
+    "query": "DevContextApi BenchmarkAsync ApiContractInfo EvidenceBenchmarkCase",
+    "expectedFiles": [
+      "RepoLens.Api/DevContextApi.cs",
+      "RepoLens/Cli/DevContextApplication.cs",
+      "RepoLens/Core/Models.cs"
+    ],
+    "expectedRelationships": [],
+    "maxTokens": 1800,
+    "maxResults": 8,
+    "graphDepth": 1
+  },
+  {
+    "name": "query filters",
+    "query": "CliArguments Parse ChangedOnly ProjectFilter Kinds IncludeTests",
+    "expectedFiles": [
+      "RepoLens/Cli/CliArguments.cs",
+      "RepoLens.Tests/CliArgumentsTests.cs",
+      "RepoLens/Core/Models.cs",
+      "RepoLens.Tests/ApiIntegrationTests.cs"
+    ],
+    "expectedRelationships": [],
+    "maxTokens": 1800,
+    "maxResults": 8,
+    "graphDepth": 1
+  },
+  {
+    "name": "schema validation",
+    "query": "ContextStore ReadStatusAsync ReadValidatedAsync EnsureReadable schema",
+    "expectedFiles": [
+      "RepoLens/Services/ContextStore.cs",
+      "RepoLens/Core/Models.cs"
+    ],
+    "expectedRelationships": [],
+    "maxTokens": 1800,
+    "maxResults": 8,
+    "graphDepth": 1
+  },
+  {
+    "name": "no repository evidence",
+    "query": "∅",
+    "expectedFiles": [],
+    "expectedRelationships": [],
+    "expectedSufficiency": "Insufficient",
+    "expectAbstention": true,
+    "maxTokens": 700,
+    "maxResults": 4,
+    "graphDepth": 1
+  }
+]

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Start Coding Task"
+  short_description: "Baseline, implement, and verify repository changes"
+  default_prompt: "Use $start-coding-task to complete this repository coding task from baseline through final verification."
+
+policy:
+  allow_implicit_invocation: true
