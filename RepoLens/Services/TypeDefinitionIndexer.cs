@@ -27,6 +27,7 @@ internal static class TypeDefinitionIndexer
         RepositoryIndex repository,
         IReadOnlyDictionary<string, CSharpCompilation> compilations,
         IReadOnlyList<SymbolRecord> symbols,
+        int maxParallelism,
         CancellationToken cancellationToken)
     {
         var symbolLookup = symbols
@@ -41,45 +42,51 @@ internal static class TypeDefinitionIndexer
                     .ThenBy(symbol => symbol.Line)
                     .First(),
                 StringComparer.Ordinal);
-        var fragments = new List<TypeDefinitionRecord>();
-
-        foreach (var project in repository.Projects)
-        {
-            if (!compilations.TryGetValue(project.Path, out var compilation))
+        var projectFragments = await ParallelWork.SelectAsync(
+            repository.Projects,
+            maxParallelism,
+            async (project, token) =>
             {
-                continue;
-            }
-
-            foreach (var tree in compilation.SyntaxTrees)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var root = await tree.GetRootAsync(cancellationToken);
-                var model = compilation.GetSemanticModel(tree, true);
-                var file = NormalizeRelative(repositoryRoot, tree.FilePath);
-                foreach (var declaration in root.DescendantNodes().OfType<BaseTypeDeclarationSyntax>())
+                var fragments = new List<TypeDefinitionRecord>();
+                if (!compilations.TryGetValue(project.Path, out var compilation))
                 {
-                    if (model.GetDeclaredSymbol(declaration, cancellationToken) is not INamedTypeSymbol typeSymbol)
-                    {
-                        continue;
-                    }
-
-                    var semanticName = typeSymbol.ToDisplayString(SymbolDisplayFormat.CSharpErrorMessageFormat);
-                    if (!symbolLookup.TryGetValue($"{project.Path}\0{semanticName}", out var symbol))
-                    {
-                        continue;
-                    }
-
-                    fragments.Add(BuildFragment(
-                        repositoryRoot,
-                        project,
-                        file,
-                        declaration,
-                        typeSymbol,
-                        symbol,
-                        cancellationToken));
+                    return fragments;
                 }
-            }
-        }
+
+                foreach (var tree in compilation.SyntaxTrees)
+                {
+                    token.ThrowIfCancellationRequested();
+                    var root = await tree.GetRootAsync(token);
+                    var model = compilation.GetSemanticModel(tree, true);
+                    var file = NormalizeRelative(repositoryRoot, tree.FilePath);
+                    foreach (var declaration in root.DescendantNodes().OfType<BaseTypeDeclarationSyntax>())
+                    {
+                        if (model.GetDeclaredSymbol(declaration, token) is not INamedTypeSymbol typeSymbol)
+                        {
+                            continue;
+                        }
+
+                        var semanticName = typeSymbol.ToDisplayString(SymbolDisplayFormat.CSharpErrorMessageFormat);
+                        if (!symbolLookup.TryGetValue($"{project.Path}\0{semanticName}", out var symbol))
+                        {
+                            continue;
+                        }
+
+                        fragments.Add(BuildFragment(
+                            repositoryRoot,
+                            project,
+                            file,
+                            declaration,
+                            typeSymbol,
+                            symbol,
+                            token));
+                    }
+                }
+
+                return fragments;
+            },
+            cancellationToken);
+        var fragments = projectFragments.SelectMany(project => project).ToArray();
 
         return fragments
             .GroupBy(fragment => fragment.SymbolIdentity, StringComparer.Ordinal)

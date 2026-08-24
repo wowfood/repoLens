@@ -10,11 +10,12 @@ delta verification, cached MSBuild/Roslyn semantic indexes, symbol-aware affecte
 project ownership for C#, Razor, XAML, content, and shared MSBuild inputs, normalized
 formatter/Qodana findings, configured cleanup, reset, text/JSON output, and regression exit codes.
 
-The engine is also packaged as the net8-compatible `RepoLens.Api` 0.7.0 library. It exposes
+The engine is also packaged as the net8-compatible `RepoLens.Api` 0.11.0 library. It exposes
 preflight diagnostics, exact MSBuild ownership explanations, richer semantic dependency edges,
 typed code metrics, source type/member definitions, deterministic hotspots,
 full/changed/project/path scopes, purpose-specific change/architecture/build/risk contexts,
-optional Cobertura coverage, bounded Git history, Markdown reports, and deterministic,
+automatic or explicit Cobertura coverage, bounded Git history, Markdown reports with structured
+trend history, published JSON Schema contracts, and deterministic,
 token-budgeted source-evidence queries. Evaluated framework/package references now feed one
 semantic compilation per target framework. Source generators can run for trusted repositories,
 generated sources are retrievable evidence, and completeness records expose unresolved references,
@@ -40,6 +41,28 @@ Stage 3 is implemented as the repository-local
 [`start-coding-task`](../../.agents/skills/start-coding-task/SKILL.md) Codex skill. It is the primary
 coding-task workflow and combines immutable baseline handling, focused reconnaissance, minimal
 implementation, configured cleanup, delta verification, and final Git review.
+
+Repository setup can now be made explicit with `dev-context init`. Project discovery, graph
+hashing, and lexical evidence share one deterministic inventory that respects `.gitignore` by
+default and supports repository-relative `indexing.exclude` globs.
+
+Project evaluation and Roslyn indexing use bounded parallel work with a configurable ceiling.
+Structural cache misses reuse unchanged per-project graph entries; changes invalidate the owning
+project and its reverse dependents while independent projects stay warm.
+
+The 0.11 CLI also exposes `status`, `affected`, `explain`, `context`, `query`, `refs`, and explicit
+`verify` tools through a standards-compatible `dev-context mcp` stdio server. One API/graph session
+is retained for the client process, with existing repository input hashes invalidating stale
+in-memory graph data.
+
+Release hardening now includes v1-to-v2 configuration migration, distinct evidence and benchmark
+exit codes, v5–v10 persisted-schema fixtures, and Windows/Linux/macOS CI coverage. The `trend`
+command compares retained diagnostic, test, churn, and hotspot-coverage metrics; `schema` emits
+draft 2020-12 contracts without requiring a repository.
+
+Change detection now unions commits made after the baseline with working-tree changes and records
+their provenance. `verify --against <ref>` provides stateless merge-base review for CI, while
+`baseline --from <ref>` carries an existing branch delta into the normal task workflow.
 
 See [`testing.md`](testing.md) for the local verification matrix, isolated regression smoke test,
 and raw-versus-compact context/token comparison procedure.
@@ -98,6 +121,8 @@ implementation guidance, cleanup, verification, and final diff review.
 At the beginning of a new logical coding task:
 
 ```text
+initialize configuration (once per repository)
+      ↓
 create baseline
       ↓
 inspect baseline/status

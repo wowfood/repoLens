@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Text.Json.Nodes;
 using DevContext.Configuration;
 using DevContext.Core;
 using DevContext.Infrastructure;
@@ -13,22 +14,33 @@ public sealed class DevContextApi
 {
     private readonly EngineServices _services;
     private bool _isNewConfiguration;
+    private bool _configurationRequiresSave;
 
     private DevContextApi(
         string repositoryRoot,
         DevContextConfig configuration,
         bool isNewConfiguration,
+        bool configurationRequiresSave,
         EngineServices services)
     {
         RepositoryRoot = repositoryRoot;
         Configuration = configuration;
         _isNewConfiguration = isNewConfiguration;
+        _configurationRequiresSave = configurationRequiresSave;
         _services = services;
     }
 
     public string RepositoryRoot { get; }
     public DevContextConfig Configuration { get; }
     public bool BaselineExists => _services.Store.BaselineExists(RepositoryRoot);
+
+    /// <summary>Names accepted by <see cref="GetJsonSchema"/>.</summary>
+    public static IReadOnlyList<string> JsonSchemaDocuments => JsonSchemaService.Documents;
+
+    /// <summary>
+    /// Returns a draft 2020-12 JSON Schema for one persisted document, or the complete catalog.
+    /// </summary>
+    public static JsonObject GetJsonSchema(string? document = null) => JsonSchemaService.Build(document);
 
     /// <summary>Describes the stable package and persisted-schema compatibility contract.</summary>
     public static ApiContractInfo Contract { get; } = new()
@@ -53,17 +65,18 @@ public sealed class DevContextApi
         var repositoryRoot = RepositoryLocator.FindRoot(startPath);
         DevContextConfig resolvedConfiguration;
         bool isNewConfiguration;
+        bool configurationRequiresSave;
 
         if (configuration is null)
         {
-            (resolvedConfiguration, isNewConfiguration) = await ConfigLoader.LoadAsync(
+            (resolvedConfiguration, isNewConfiguration, configurationRequiresSave) = await ConfigLoader.LoadAsync(
                 repositoryRoot,
                 cancellationToken);
         }
         else
         {
-            ConfigLoader.Validate(configuration);
-            resolvedConfiguration = configuration;
+            resolvedConfiguration = ConfigLoader.Migrate(configuration, out configurationRequiresSave);
+            ConfigLoader.Validate(resolvedConfiguration);
             isNewConfiguration = false;
         }
 
@@ -71,6 +84,7 @@ public sealed class DevContextApi
             repositoryRoot,
             resolvedConfiguration,
             isNewConfiguration,
+            configurationRequiresSave,
             CreateServices());
     }
 
@@ -97,8 +111,45 @@ public sealed class DevContextApi
             bundle.Affected);
     }
 
-    public async Task<StatusReport> BaselineAsync(
+    /// <summary>
+    /// Writes a validated default configuration when one does not already exist, or atomically
+    /// saves a supported configuration migration. Current configuration is never overwritten.
+    /// </summary>
+    public async Task<InitializationReport> InitializeAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var created = _isNewConfiguration;
+        var migrated = _configurationRequiresSave;
+        await _services.Store.SaveConfigIfNeededAsync(
+            RepositoryRoot,
+            Configuration,
+            created || migrated,
+            cancellationToken);
+        _isNewConfiguration = false;
+        _configurationRequiresSave = false;
+
+        return new InitializationReport
+        {
+            RepositoryRoot = RepositoryRoot,
+            ConfigPath = ContextPaths.Config(RepositoryRoot),
+            Created = created,
+            Migrated = migrated,
+            Configuration = Configuration
+        };
+    }
+
+    public Task<StatusReport> BaselineAsync(
         bool replace = false,
+        CancellationToken cancellationToken = default) =>
+        BaselineAsync(replace, null, cancellationToken);
+
+    /// <summary>
+    /// Captures a baseline whose Git diff base is the merge base of <paramref name="fromReference"/>
+    /// and the current HEAD. Current health remains the baseline for later regression comparison.
+    /// </summary>
+    public async Task<StatusReport> BaselineAsync(
+        bool replace,
+        string? fromReference,
         CancellationToken cancellationToken = default)
     {
         if (BaselineExists && !replace)
@@ -107,10 +158,10 @@ public sealed class DevContextApi
                 "A baseline already exists. Set replace only when explicitly beginning a new logical task.");
         }
 
-        await _services.Store.SaveConfigIfNewAsync(
+        await _services.Store.SaveConfigIfNeededAsync(
             RepositoryRoot,
             Configuration,
-            _isNewConfiguration,
+            _isNewConfiguration || _configurationRequiresSave,
             cancellationToken);
 
         var bundle = await _services.Capture.CaptureAsync(
@@ -121,6 +172,27 @@ public sealed class DevContextApi
             null,
             cancellationToken);
 
+        if (!string.IsNullOrWhiteSpace(fromReference))
+        {
+            var referenceChanges = await _services.Git.ChangesAgainstReferenceAsync(
+                RepositoryRoot,
+                fromReference,
+                bundle.Git,
+                cancellationToken);
+            var baseCommit = referenceChanges.BaseCommit
+                             ?? throw new InvalidOperationException("Git reference comparison produced no merge base.");
+            bundle = bundle with
+            {
+                Git = bundle.Git with { HeadCommit = baseCommit },
+                Manifest = bundle.Manifest with
+                {
+                    HeadCommit = baseCommit,
+                    CapturedHeadCommit = bundle.Git.HeadCommit,
+                    DiffBaseReference = fromReference
+                }
+            };
+        }
+
         await _services.Store.SaveBaselineAsync(
             RepositoryRoot,
             bundle,
@@ -129,7 +201,67 @@ public sealed class DevContextApi
             cancellationToken);
 
         _isNewConfiguration = false;
+        _configurationRequiresSave = false;
         return await StatusAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Runs stateless current-health verification and affected analysis against the merge base of
+    /// a Git reference and HEAD. No immutable baseline is required or created.
+    /// </summary>
+    public async Task<ReferenceReviewReport> ReviewAsync(
+        string reference,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(reference);
+        var bundle = await _services.Capture.CaptureAsync(
+            RepositoryRoot,
+            Configuration,
+            null,
+            CapturePurpose.ReferenceReview,
+            null,
+            cancellationToken,
+            reference);
+        var changes = bundle.Changes
+                      ?? throw new InvalidOperationException("Reference review did not produce a Git change set.");
+        var affected = bundle.Affected
+                       ?? throw new InvalidOperationException("Reference review did not produce affected-code analysis.");
+        var executionFailures = bundle.Build.State == ExecutionState.Unavailable
+                                || bundle.Tests.State == ExecutionState.Unavailable
+                                || bundle.Tests.State == ExecutionState.Failed && bundle.Tests.Outcomes.Count == 0;
+        var providerFailures = Configuration.Analysis.DotnetFormat
+                               && bundle.Analysis.DotnetFormat.State is ExecutionState.Failed or ExecutionState.Unavailable
+                               || Configuration.Analysis.Qodana
+                               && bundle.Analysis.Qodana.State is ExecutionState.Failed or ExecutionState.Unavailable;
+        var diagnosticFailures = bundle.Analysis.Diagnostics.Any(diagnostic =>
+            diagnostic.Severity == "error"
+            || Configuration.Analysis.FailOnNewWarnings && diagnostic.Severity == "warning");
+        var testFailures = bundle.Tests.Outcomes.Any(outcome => TestService.IsFailed(outcome.Outcome));
+        var hasFailures = bundle.Build.State == ExecutionState.Failed
+                          || bundle.Tests.State == ExecutionState.Failed
+                          || providerFailures
+                          || diagnosticFailures
+                          || testFailures;
+
+        return new ReferenceReviewReport
+        {
+            Reference = reference,
+            BaseCommit = changes.BaseCommit!,
+            HeadCommit = changes.HeadCommit!,
+            VerifiedAtUtc = DateTimeOffset.UtcNow,
+            ChangedFiles = changes.ChangedFiles,
+            Changes = changes.Changes,
+            Projects = affected.Projects,
+            Symbols = affected.Symbols,
+            ChangedSymbols = affected.ChangedSymbols,
+            Tests = affected.Tests,
+            TestCases = affected.TestCases,
+            CurrentBuild = bundle.Build,
+            CurrentTests = bundle.Tests,
+            CurrentAnalysis = bundle.Analysis,
+            HasFailures = hasFailures,
+            HasExecutionFailures = executionFailures || providerFailures
+        };
     }
 
     public Task<StatusReport> StatusAsync(CancellationToken cancellationToken = default)
@@ -160,7 +292,13 @@ public sealed class DevContextApi
     /// Checks the local SDK, configuration, project discovery, and optional tool providers.
     /// This operation does not require or create a baseline.
     /// </summary>
-    public async Task<DoctorReport> DoctorAsync(CancellationToken cancellationToken = default)
+    public Task<DoctorReport> DoctorAsync(CancellationToken cancellationToken = default) =>
+        DoctorAsync(true, cancellationToken);
+
+    /// <summary>Runs diagnostics, optionally bypassing the repository graph cache.</summary>
+    public async Task<DoctorReport> DoctorAsync(
+        bool useCache,
+        CancellationToken cancellationToken = default)
     {
         var checks = new List<DoctorCheck>();
         var sdk = await _services.Runner.RunAsync(
@@ -183,6 +321,26 @@ public sealed class DevContextApi
             File.Exists(configPath)
                 ? $"Loaded {Path.GetRelativePath(RepositoryRoot, configPath).Replace('\\', '/')}"
                 : "Using inferred defaults; no configuration file has been saved yet."));
+
+        var inventory = await _services.Files.GetFilesAsync(
+            RepositoryRoot,
+            Configuration.Indexing,
+            cancellationToken);
+        var configuredExcludes = Configuration.Indexing.Exclude.Count == 0
+            ? "none"
+            : string.Join(", ", Configuration.Indexing.Exclude);
+        checks.Add(new DoctorCheck(
+            "Repository scope",
+            Configuration.Indexing.RespectGitignore && !inventory.GitIgnoreApplied
+                ? DoctorCheckState.Warning
+                : DoctorCheckState.Passed,
+            $"{inventory.RelativePaths.Count} files selected; .gitignore " +
+            $"{(Configuration.Indexing.RespectGitignore ? inventory.GitIgnoreApplied ? "applied" : "requested but unavailable" : "disabled")}; " +
+            $"built-in excludes: {string.Join(", ", RepositoryFileFilter.BuiltInExcludes)}; " +
+            $"configured excludes: {configuredExcludes}.",
+            Configuration.Indexing.RespectGitignore && !inventory.GitIgnoreApplied
+                ? "Ensure Git is available so repository ignore rules can be applied."
+                : null));
 
         var solutionPath = string.IsNullOrWhiteSpace(Configuration.Solution)
             ? null
@@ -218,9 +376,12 @@ public sealed class DevContextApi
                 "Check user/repository NuGet.Config permissions and source definitions."));
 
         IReadOnlyList<DoctorProjectSummary> projects = [];
+        IReadOnlyList<CompilationCompletenessRecord> compilationCompleteness = [];
         try
         {
-            var diagnosticConfig = Configuration with { Cache = new CacheConfig { Enabled = false } };
+            var diagnosticConfig = useCache
+                ? Configuration
+                : Configuration with { Cache = new CacheConfig { Enabled = false } };
             var graph = await _services.Graph.BuildAsync(
                 RepositoryRoot,
                 diagnosticConfig,
@@ -236,6 +397,16 @@ public sealed class DevContextApi
                         .ToArray()))
                 .OrderBy(project => project.Path, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
+            compilationCompleteness = graph.Symbols.CompilationCompleteness;
+            checks.Add(new DoctorCheck(
+                "Repository graph cache",
+                DoctorCheckState.Informational,
+                useCache
+                    ? graph.CacheHit
+                        ? $"HIT ({graph.ProjectCacheHits} project entries reused)."
+                        : $"MISS ({graph.ProjectCacheHits} project entries reused, " +
+                          $"{graph.ProjectCacheMisses} rebuilt)."
+                    : "BYPASSED by request."));
             checks.Add(projects.Count > 0
                 ? new DoctorCheck(
                     "Project discovery",
@@ -250,18 +421,30 @@ public sealed class DevContextApi
                 .Count(record => record.State == AnalysisCompletenessState.Partial);
             var failedCompilations = graph.Symbols.CompilationCompleteness
                 .Count(record => record.State == AnalysisCompletenessState.Failed);
+            var topDiagnostics = graph.Symbols.CompilationCompleteness
+                .SelectMany(record => record.DiagnosticSummaries)
+                .GroupBy(summary => summary.Id, StringComparer.Ordinal)
+                .Select(group => new { Id = group.Key, Count = group.Sum(summary => summary.Count) })
+                .OrderByDescending(summary => summary.Count)
+                .ThenBy(summary => summary.Id, StringComparer.Ordinal)
+                .Take(5)
+                .Select(summary => $"{summary.Id} x{summary.Count}")
+                .ToArray();
+            var diagnosticRecommendation = topDiagnostics.Length == 0
+                ? "Run doctor --explain-gaps for the per-project completeness breakdown."
+                : $"Top diagnostics: {string.Join(", ", topDiagnostics)}. Run doctor --explain-gaps for files and gaps.";
             checks.Add(failedCompilations > 0
                 ? new DoctorCheck(
                     "Semantic completeness",
                     DoctorCheckState.Failed,
                     $"{failedCompilations} failed and {partialCompilations} partial semantic compilation(s).",
-                    "Inspect compilationCompleteness in JSON context for unresolved references and generated-source gaps.")
+                    diagnosticRecommendation)
                 : partialCompilations > 0
                     ? new DoctorCheck(
                         "Semantic completeness",
                         DoctorCheckState.Warning,
                         $"{partialCompilations} of {graph.Symbols.CompilationCompleteness.Count} semantic compilation(s) are partial.",
-                        "Inspect compilationCompleteness in JSON context before treating missing relationships as absent.")
+                        diagnosticRecommendation)
                     : new DoctorCheck(
                         "Semantic completeness",
                         DoctorCheckState.Passed,
@@ -314,6 +497,7 @@ public sealed class DevContextApi
             SdkVersion = sdk.State == ExecutionState.Succeeded ? sdk.StandardOutput.Trim() : null,
             BaselineExists = BaselineExists,
             Projects = projects,
+            CompilationCompleteness = compilationCompleteness,
             Checks = checks
         };
     }
@@ -392,6 +576,19 @@ public sealed class DevContextApi
             cancellationToken);
     }
 
+    /// <summary>Returns exact, direction-aware structural relationships for one resolved symbol.</summary>
+    public Task<SymbolReferenceQueryReport> QueryReferencesAsync(
+        SymbolReferenceQueryOptions options,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        return _services.References.QueryAsync(
+            RepositoryRoot,
+            Configuration,
+            options,
+            cancellationToken);
+    }
+
     /// <summary>
     /// Runs a repeatable evidence-retrieval corpus twice per case and reports recall,
     /// precision, token use, latency, and deterministic-output checks.
@@ -419,23 +616,39 @@ public sealed class DevContextApi
             cancellationToken);
     }
 
-    public void Reset() => _services.Store.Reset(RepositoryRoot);
+    /// <summary>
+    /// Compares versioned metrics retained alongside default Markdown reports.
+    /// </summary>
+    public Task<RepositoryTrendReport> TrendAsync(
+        int maxPoints = 20,
+        CancellationToken cancellationToken = default) =>
+        _services.Intelligence.TrendAsync(RepositoryRoot, maxPoints, cancellationToken);
+
+    public void Reset()
+    {
+        _services.Store.Reset(RepositoryRoot);
+        _services.Graph.ClearMemoryCache();
+    }
 
     private static EngineServices CreateServices()
     {
         IProcessRunner runner = new ProcessRunner();
         var git = new GitService(runner);
-        var projects = new ProjectIndexer(runner);
-        var graph = new RepositoryGraphService(runner, projects);
+        var files = new RepositoryFileFilter(runner);
+        var projects = new ProjectIndexer(runner, files);
+        var graph = new RepositoryGraphService(runner, projects, files);
         var build = new BuildService(runner);
         var tests = new TestService(runner);
         var analysis = new AnalysisService(runner);
         var store = new ContextStore();
         var capture = new BaselineCaptureService(runner, git, graph, build, tests, analysis);
 
-        var evidence = new EvidenceQueryService(graph, git, store);
+        var evidence = new EvidenceQueryService(graph, git, store, files);
+        var references = new SymbolReferenceQueryService(graph);
         return new EngineServices(
             runner,
+            git,
+            files,
             graph,
             store,
             capture,
@@ -444,6 +657,7 @@ public sealed class DevContextApi
             new CleanupService(runner, git),
             new RepositoryIntelligenceService(runner, git, graph, store),
             evidence,
+            references,
             new EvidenceBenchmarkService(evidence));
     }
 
@@ -483,6 +697,8 @@ public sealed class DevContextApi
 
     private sealed record EngineServices(
         IProcessRunner Runner,
+        GitService Git,
+        RepositoryFileFilter Files,
         RepositoryGraphService Graph,
         ContextStore Store,
         BaselineCaptureService Capture,
@@ -491,5 +707,6 @@ public sealed class DevContextApi
         CleanupService Cleanup,
         RepositoryIntelligenceService Intelligence,
         EvidenceQueryService Evidence,
+        SymbolReferenceQueryService References,
         EvidenceBenchmarkService Benchmark);
 }

@@ -10,17 +10,51 @@ internal static class AffectedCalculator
         DependencyIndex baselineDependencies,
         GitSnapshot currentGit,
         RepositoryGraph currentGraph)
+        => Calculate(
+            baseline,
+            baselineSymbols,
+            baselineDependencies,
+            currentGraph,
+            GitService.WorkingTreeChangesSince(baseline.Git, currentGit));
+
+    public static AffectedReport Calculate(
+        StatusReport baseline,
+        SymbolIndex baselineSymbols,
+        DependencyIndex baselineDependencies,
+        RepositoryGraph currentGraph,
+        GitChangeSet changes) => CalculateCore(
+        baseline.Repository.Projects,
+        baselineSymbols.Symbols,
+        baselineDependencies,
+        currentGraph,
+        changes);
+
+    public static AffectedReport Calculate(
+        RepositoryGraph currentGraph,
+        GitChangeSet changes) => CalculateCore(
+        [],
+        [],
+        new DependencyIndex { Projects = [], Types = [] },
+        currentGraph,
+        changes);
+
+    private static AffectedReport CalculateCore(
+        IReadOnlyList<ProjectRecord> baselineProjects,
+        IReadOnlyList<SymbolRecord> baselineSymbols,
+        DependencyIndex baselineDependencies,
+        RepositoryGraph currentGraph,
+        GitChangeSet changes)
     {
-        var changedFiles = GitService.ChangedSince(baseline.Git, currentGit);
+        var changedFiles = changes.ChangedFiles;
         var allProjects = currentGraph.Repository.Projects
-            .Concat(baseline.Repository.Projects)
+            .Concat(baselineProjects)
             .DistinctBy(project => project.Path, StringComparer.OrdinalIgnoreCase)
             .ToArray();
         var directlyAffected = changedFiles
             .SelectMany(file => ProjectOwnershipResolver.Explain(file, allProjects))
             .Select(project => project.ProjectPath)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var changedSymbols = baselineSymbols.Symbols
+        var changedSymbols = baselineSymbols
             .Concat(currentGraph.Symbols.Symbols)
             .Where(symbol => changedFiles.Contains(symbol.File, StringComparer.OrdinalIgnoreCase))
             .DistinctBy(symbol => symbol.Identity, StringComparer.Ordinal)
@@ -55,7 +89,7 @@ internal static class AffectedCalculator
             affectedProjects,
             projectDependencies));
 
-        var allSymbols = baselineSymbols.Symbols
+        var allSymbols = baselineSymbols
             .Concat(currentGraph.Symbols.Symbols)
             .DistinctBy(symbol => symbol.Identity, StringComparer.Ordinal)
             .ToArray();
@@ -84,6 +118,8 @@ internal static class AffectedCalculator
         return new AffectedReport
         {
             ChangedFiles = changedFiles,
+            Changes = changes.Changes,
+            GitComparison = changes.Comparison,
             Projects = affectedProjects.Order(StringComparer.Ordinal).ToArray(),
             Symbols = affectedSymbols,
             ChangedSymbols = changedSymbols.Values

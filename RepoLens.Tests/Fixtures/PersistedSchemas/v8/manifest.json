@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 8,
+  "baselineId": "schema-v8-fixture",
+  "createdAtUtc": "2026-01-01T00:00:00+00:00",
+  "repositoryRoot": "/fixture",
+  "branch": "feature/schema",
+  "headCommit": "2222222222222222222222222222222222222222",
+  "workingTreeDirty": true,
+  "sdkVersion": "9.0.200",
+  "timings": [
+    { "stage": "graph", "durationMilliseconds": 10 }
+  ]
+}

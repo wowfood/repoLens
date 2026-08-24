@@ -62,10 +62,13 @@ public sealed class ParsingTests
     [TestMethod]
     public void BuildDiagnostics_AreNormalizedWithStableIdentity()
     {
-        const string output = @"C:\work\src\Foo.cs(47,12): warning CA2007: Consider calling ConfigureAwait [C:\work\Foo.csproj]";
+        var repository = Path.Combine(Path.GetTempPath(), "dev-context-build-parser");
+        var file = Path.Combine(repository, "src", "Foo.cs");
+        var project = Path.Combine(repository, "Foo.csproj");
+        var output = $"{file}(47,12): warning CA2007: Consider calling ConfigureAwait [{project}]";
 
-        var first = BuildService.ParseDiagnostics(output, @"C:\work").Single();
-        var second = BuildService.ParseDiagnostics(output, @"C:\work").Single();
+        var first = BuildService.ParseDiagnostics(output, repository).Single();
+        var second = BuildService.ParseDiagnostics(output, repository).Single();
 
         Assert.AreEqual("warning", first.Severity);
         Assert.AreEqual("CA2007", first.Rule);
@@ -124,27 +127,33 @@ public sealed class ParsingTests
     public void DotnetFormatReport_IsNormalizedIntoStableDiagnostics()
     {
         var path = Path.Combine(Path.GetTempPath(), $"dev-context-format-{Guid.NewGuid():N}.json");
+        var repository = Path.Combine(Path.GetTempPath(), "dev-context-format-parser");
         try
         {
-            File.WriteAllText(path,
-                """
-                [
-                  {
-                    "FileName": "Foo.cs",
-                    "FilePath": "C:\\work\\src\\Foo.cs",
-                    "FileChanges": [
-                      {
-                        "LineNumber": 4,
-                        "CharNumber": 8,
-                        "DiagnosticId": "WHITESPACE",
-                        "FormatDescription": "Fix whitespace formatting."
-                      }
-                    ]
-                  }
-                ]
-                """);
+            File.WriteAllText(
+                path,
+                JsonSerializer.Serialize(
+                    new[]
+                    {
+                        new
+                        {
+                            FileName = "Foo.cs",
+                            FilePath = Path.Combine(repository, "src", "Foo.cs"),
+                            FileChanges = new[]
+                            {
+                                new
+                                {
+                                    LineNumber = 4,
+                                    CharNumber = 8,
+                                    DiagnosticId = "WHITESPACE",
+                                    FormatDescription = "Fix whitespace formatting."
+                                }
+                            }
+                        }
+                    },
+                    JsonDefaults.Options));
 
-            var diagnostic = AnalysisService.ParseFormatReport(path, @"C:\work").Single();
+            var diagnostic = AnalysisService.ParseFormatReport(path, repository).Single();
 
             Assert.AreEqual("dotnet-format", diagnostic.Tool);
             Assert.AreEqual("WHITESPACE", diagnostic.Rule);
@@ -161,6 +170,7 @@ public sealed class ParsingTests
     public void SarifReport_IsNormalizedIntoStableDiagnostics()
     {
         var path = Path.Combine(Path.GetTempPath(), $"dev-context-qodana-{Guid.NewGuid():N}.sarif.json");
+        var repository = Path.Combine(Path.GetTempPath(), "dev-context-sarif-parser");
         try
         {
             File.WriteAllText(path,
@@ -189,7 +199,7 @@ public sealed class ParsingTests
                 }
                 """);
 
-            var diagnostic = AnalysisService.ParseSarif(path, @"C:\work", "qodana").Single();
+            var diagnostic = AnalysisService.ParseSarif(path, repository, "qodana").Single();
 
             Assert.AreEqual("qodana", diagnostic.Tool);
             Assert.AreEqual("warning", diagnostic.Severity);

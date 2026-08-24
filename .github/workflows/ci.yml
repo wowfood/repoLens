@@ -9,7 +9,11 @@ permissions:
 
 jobs:
   verify:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
       DOTNET_NOLOGO: true
@@ -42,7 +46,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: repolens-packages-and-smoke
+          name: repolens-${{ matrix.os }}-packages-and-smoke
           path: |
             artifacts/packages/*
             artifacts/smoke/**/summary.json

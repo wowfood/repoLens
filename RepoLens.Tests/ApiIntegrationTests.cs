@@ -9,6 +9,44 @@ namespace DevContext.Tests;
 public sealed class ApiIntegrationTests
 {
     [TestMethod]
+    public async Task Affected_ReportsFilesCommittedAfterTheBaseline()
+    {
+        var repository = CreateTemporaryDirectory();
+        try
+        {
+            await RunGitAsync(repository, "init", "--quiet");
+            await RunGitAsync(repository, "config", "user.email", "dev-context@example.test");
+            await RunGitAsync(repository, "config", "user.name", "Dev Context Tests");
+            await File.WriteAllTextAsync(Path.Combine(repository, "Tracked.cs"), "public class Before;");
+            await RunGitAsync(repository, "add", "--all");
+            await RunGitAsync(repository, "commit", "--quiet", "-m", "initial");
+
+            var api = await DevContextApi.OpenAsync(
+                repository,
+                new DevContextConfig { Tests = new TestConfig { Enabled = false } });
+            await api.BaselineAsync();
+            await File.WriteAllTextAsync(Path.Combine(repository, "Tracked.cs"), "public class After;");
+            await RunGitAsync(repository, "add", "--all");
+            await RunGitAsync(repository, "commit", "--quiet", "-m", "change after baseline");
+
+            var affected = await api.AffectedAsync();
+
+            CollectionAssert.AreEqual(new[] { "Tracked.cs" }, affected.ChangedFiles.ToArray());
+            Assert.AreEqual(GitComparisonState.Comparable, affected.GitComparison);
+            Assert.AreEqual(GitChangeProvenance.Committed, affected.Changes.Single().Provenance);
+
+            var verification = await api.VerifyAsync();
+            CollectionAssert.AreEqual(new[] { "Tracked.cs" }, verification.ChangedFiles.ToArray());
+            Assert.AreEqual(GitChangeProvenance.Committed, verification.Changes.Single().Provenance);
+            Assert.IsFalse(verification.HasExecutionFailures);
+        }
+        finally
+        {
+            DeleteTemporaryDirectory(repository);
+        }
+    }
+
+    [TestMethod]
     public async Task PublicApi_CapturesAndManagesBaselineWithoutCliProcess()
     {
         var repository = CreateTemporaryDirectory();
@@ -27,6 +65,7 @@ public sealed class ApiIntegrationTests
             var doctor = await api.DoctorAsync();
             Assert.IsNotNull(doctor.SdkVersion);
             Assert.IsTrue(doctor.Checks.Any(check => check.Name == "Project discovery"));
+            Assert.IsTrue(doctor.Checks.Any(check => check.Name == "Repository scope"));
             Assert.IsFalse(api.BaselineExists, "Diagnostics must not create baseline state.");
 
             var explanation = await api.ExplainAsync("src");
@@ -71,7 +110,7 @@ public sealed class ApiIntegrationTests
         Assert.AreEqual(SchemaVersions.Current, DevContextApi.Contract.CurrentSchemaVersion);
         Assert.AreEqual(SchemaVersions.MinimumReadable, DevContextApi.Contract.MinimumReadableSchemaVersion);
         Assert.IsTrue(DevContextApi.Contract.RequiresTrustedRepository);
-        StringAssert.StartsWith(DevContextApi.Contract.PackageVersion, "0.7.0");
+        StringAssert.StartsWith(DevContextApi.Contract.PackageVersion, "0.11.0");
     }
 
     [TestMethod]
@@ -222,6 +261,13 @@ public sealed class ApiIntegrationTests
                     CurrentSongs = await songs.GetSongsAsync();
                 }
             }
+
+            public sealed class ReferenceTargetA { public void SharedReferenceTarget() { } }
+            public sealed class ReferenceTargetB { public void SharedReferenceTarget() { } }
+            public sealed class ReferenceTargetC { public void SharedReferenceTarget() { } }
+            public sealed class ReferenceTargetD { public void SharedReferenceTarget() { } }
+            public sealed class ReferenceTargetE { public void SharedReferenceTarget() { } }
+            public sealed class ReferenceTargetF { public void SharedReferenceTarget() { } }
             """);
         await File.WriteAllTextAsync(
             Path.Combine(tests, "Sample.Tests.csproj"),
@@ -267,6 +313,27 @@ public sealed class ApiIntegrationTests
                 Query = "∅",
                 MaxTokens = 700,
                 MaxResults = 4
+            });
+            var callers = await api.QueryReferencesAsync(new SymbolReferenceQueryOptions
+            {
+                Target = "RefreshDashboardAsync",
+                Relation = SymbolReferenceRelation.Callers,
+                MaxTokens = 700,
+                MaxResults = 5
+            });
+            var noWriters = await api.QueryReferencesAsync(new SymbolReferenceQueryOptions
+            {
+                Target = "RefreshDashboardAsync",
+                Relation = SymbolReferenceRelation.Writers,
+                MaxTokens = 700,
+                MaxResults = 5
+            });
+            var ambiguous = await api.QueryReferencesAsync(new SymbolReferenceQueryOptions
+            {
+                Target = "SharedReferenceTarget",
+                Relation = SymbolReferenceRelation.Callers,
+                MaxTokens = 256,
+                MaxResults = 20
             });
             var benchmark = await api.BenchmarkAsync(
             [
@@ -349,6 +416,30 @@ public sealed class ApiIntegrationTests
             Assert.IsTrue(absent.ShouldAbstain);
             Assert.IsEmpty(absent.Blocks);
             StringAssert.Contains(absent.Prompt, "Do not infer an implementation answer or proof of absence");
+            Assert.AreEqual("RefreshDashboardAsync", callers.ResolvedSymbol?.Name);
+            Assert.IsTrue(callers.Matches.Any(match =>
+                match.Source.Name == "RefreshDashboardLoadsSongs"
+                && match.Relationship == "method-call"));
+            Assert.AreNotEqual(EvidenceSufficiency.Insufficient, callers.Sufficiency);
+            Assert.IsFalse(callers.ShouldAbstain);
+            Assert.IsLessThanOrEqualTo(700, callers.ApproximateTokens);
+            Assert.IsEmpty(noWriters.Matches);
+            if (noWriters.CompilationCompleteness.All(record =>
+                    record.State == AnalysisCompletenessState.Complete))
+            {
+                Assert.AreEqual(EvidenceSufficiency.Sufficient, noWriters.Sufficiency);
+                Assert.IsFalse(noWriters.ShouldAbstain, "Complete analysis can prove that no matching edge exists.");
+            }
+            else
+            {
+                Assert.AreEqual(EvidenceSufficiency.Insufficient, noWriters.Sufficiency);
+                Assert.IsTrue(noWriters.ShouldAbstain, "Incomplete analysis cannot prove the absence of an edge.");
+            }
+            Assert.IsNull(ambiguous.ResolvedSymbol);
+            Assert.IsTrue(ambiguous.ShouldAbstain);
+            Assert.IsTrue(ambiguous.Truncated);
+            Assert.IsLessThan(6, ambiguous.AmbiguousSymbols.Count);
+            Assert.IsLessThanOrEqualTo(256, ambiguous.ApproximateTokens);
             Assert.IsFalse(api.BaselineExists, "Evidence queries must not create baseline state.");
             Assert.IsTrue(benchmark.Passed);
             Assert.AreEqual(1d, benchmark.MeanFileRecall);
@@ -396,6 +487,22 @@ public sealed class ApiIntegrationTests
         var path = Path.Combine(Path.GetTempPath(), $"repolens-api-integration-{Guid.NewGuid():N}");
         Directory.CreateDirectory(path);
         return path;
+    }
+
+    private static async Task RunGitAsync(string repository, params string[] arguments)
+    {
+        var result = await RunProcessAsync("git", arguments, repository);
+        Assert.AreEqual(0, result.ExitCode, result.StandardError);
+    }
+
+    private static void DeleteTemporaryDirectory(string path)
+    {
+        foreach (var file in Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories))
+        {
+            File.SetAttributes(file, FileAttributes.Normal);
+        }
+
+        Directory.Delete(path, true);
     }
 
     private sealed record ProcessResult(int ExitCode, string StandardOutput, string StandardError);

@@ -69,7 +69,7 @@
       "RepoLens/Cli/CliArguments.cs",
       "RepoLens.Tests/CliArgumentsTests.cs",
       "RepoLens/Core/Models.cs",
-      "RepoLens.Tests/ApiIntegrationTests.cs"
+      "RepoLens/Cli/DevContextApplication.cs"
     ],
     "expectedRelationships": [],
     "maxTokens": 1800,

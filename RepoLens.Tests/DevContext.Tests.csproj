@@ -11,12 +11,18 @@
 
     <ItemGroup>
         <PackageReference Include="MSTest" Version="4.0.2" />
+        <PackageReference Include="ModelContextProtocol" Version="2.2.0" />
         <ProjectReference Include="..\RepoLens.Api\RepoLens.Api.csproj" />
         <ProjectReference Include="..\RepoLens\RepoLens.csproj" />
     </ItemGroup>
 
     <ItemGroup>
         <Using Include="Microsoft.VisualStudio.TestTools.UnitTesting" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <Content Include="Fixtures\PersistedSchemas\**\*.json"
+                 CopyToOutputDirectory="PreserveNewest" />
     </ItemGroup>
 
 </Project>

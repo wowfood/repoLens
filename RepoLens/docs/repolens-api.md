@@ -6,13 +6,14 @@ MSBuild ownership, build bounded repository contexts, or use the same immutable 
 affected-code, cleanup, and verification lifecycle as the CLI.
 
 ```powershell
-dotnet add package RepoLens.Api --version 0.7.0
+dotnet add package RepoLens.Api --version 0.11.0
 ```
 
 ```csharp
 using DevContext;
 
 var api = await DevContextApi.OpenAsync(repositoryPath, cancellationToken: cancellationToken);
+var initialization = await api.InitializeAsync(cancellationToken);
 var snapshot = await api.CaptureAsync(cancellationToken);
 
 Console.WriteLine($"Projects: {snapshot.Repository.Projects.Count}");
@@ -36,8 +37,27 @@ var affected = await api.AffectedAsync(cancellationToken);
 var verification = await api.VerifyAsync(cancellationToken);
 ```
 
+Affected, verification, changed-only evidence, and change contexts union commit-range changes with
+working-tree changes. Their `Changes` records distinguish `Committed`, `WorkingTree`, and `Both`.
+`GitComparison` is `BaselineDiverged` when the stored HEAD is no longer an ancestor; verification
+then reports an execution failure and changed-only evidence requires abstention rather than
+presenting an incomplete delta as authoritative.
+
+For stateless branch review:
+
+```csharp
+var review = await api.ReviewAsync("origin/main", cancellationToken);
+Console.WriteLine($"{review.ChangedFiles.Count} files since {review.BaseCommit}");
+```
+
+`ReviewAsync` uses `merge-base(reference, HEAD)`, includes current working-tree changes, runs
+current verification, and never creates or replaces baseline state. To persist the same merge base
+for a longer task, call
+`BaselineAsync(replace: false, fromReference: "origin/main", cancellationToken: cancellationToken)`.
+
 `BaselineAsync` refuses to replace existing task state unless `replace: true` is supplied
-explicitly. `CaptureAsync` is stateless and does not create or replace a baseline.
+explicitly. `InitializeAsync` creates validated configuration only when it is absent and never
+creates a baseline. `CaptureAsync` is stateless and does not create or replace a baseline.
 
 ## Diagnostics and project ownership
 
@@ -60,6 +80,17 @@ semantic-compilation completeness, and enabled optional providers. Ownership use
 MSBuild item types, so Blazor
 `RazorComponent`, WPF `Page`/`ApplicationDefinition`, and MAUI item types are explained without
 extension guessing.
+
+Configured `.sln`, `.slnx`, and `.slnf` files define the initial project set; transitive project
+references are then included. C#, F#, and Visual Basic project files participate in MSBuild
+ownership and dependency propagation. F#/VB projects expose an explicit partial-completeness gap
+instead of being omitted or parsed as C#.
+
+`DoctorAsync()` uses the graph cache; call
+`DoctorAsync(useCache: false, cancellationToken: cancellationToken)` for a cold diagnostic.
+`DoctorReport.CompilationCompleteness` includes grouped diagnostic IDs, counts, and source files.
+Source-generator dependencies are isolated and resolved together, and distinct incremental
+generators are preserved even when Roslyn represents them with the same adapter type.
 
 ## Token-bounded source evidence
 
@@ -120,6 +151,27 @@ version and persisted-schema compatibility window before a consumer reads stored
 Benchmark cases can set `ExpectedSufficiency` and `ExpectAbstention` so no-evidence behavior is a
 measured contract rather than an untested fallback.
 
+## Exact structural references
+
+Use `QueryReferencesAsync` when the question maps directly to an indexed edge and ranked lexical
+evidence would add noise:
+
+```csharp
+var callers = await api.QueryReferencesAsync(new SymbolReferenceQueryOptions
+{
+    Target = "EvidenceQueryService.EvaluateSufficiency",
+    Relation = SymbolReferenceRelation.Callers,
+    MaxResults = 25,
+    MaxTokens = 1200
+}, cancellationToken);
+```
+
+Targets may be fully-qualified names, unique bare names, or `file:line`. Ambiguous names return
+typed candidates and require abstention. Matches retain their source and target symbols, typed
+relationship, confidence, origin, framework, and evidence span. Empty matches are authoritative
+only when relevant compilation completeness is sufficient; otherwise the report explicitly
+abstains.
+
 ## Purpose-specific context and hotspots
 
 ```csharp
@@ -142,7 +194,10 @@ Purposes are `Change`, `Architecture`, `Build`, and `Risk`. Scopes are automatic
 changed files, project, and path. The report exposes typed projects, files, symbols, scoped type
 definitions, semantic-compilation completeness, type/method metrics, semantic dependency edges,
 diagnostics, failing tests, Git
-churn, optional Cobertura coverage, and transparently ranked file hotspots. Hotspots are ordered
+churn, optional Cobertura coverage, and transparently ranked file hotspots. When the repository's
+v2 configuration enables `Tests.CollectCoverage`, baseline and verification runs persist Coverlet
+Cobertura reports and context uses the latest automatically; an explicit `CoberturaPath` remains
+the highest-priority input. Hotspots are ordered
 lexicographically by observable metrics rather than an opaque weighted score, and every result
 includes selection reasons.
 
@@ -158,10 +213,24 @@ Save an explicitly requested Markdown artifact with bounded default history:
 
 ```csharp
 var artifact = await api.SaveReportAsync(context, retain: 20, cancellationToken: cancellationToken);
+var trend = await api.TrendAsync(maxPoints: 20, cancellationToken: cancellationToken);
 ```
 
 Default reports are written beneath `.dev-context/reports`. Passing an explicit output path does
-not apply default-directory retention.
+not apply default-directory retention. Each report has a versioned trend sidecar; trend deltas are
+computed only within the same purpose/scope/target series.
+
+Non-.NET consumers can obtain draft 2020-12 JSON Schema for persisted contracts without opening a
+repository:
+
+```csharp
+var documentNames = DevContextApi.JsonSchemaDocuments;
+var testSnapshotSchema = DevContextApi.GetJsonSchema("tests");
+var completeCatalog = DevContextApi.GetJsonSchema();
+```
+
+The current package reads configuration versions 1–2. `InitializeAsync` or the next baseline save
+rewrites v1 configuration as v2 while retaining backward-compatible defaults.
 
 ## Trust and current boundaries
 

@@ -13,7 +13,14 @@ public static class OutputFormatter
         builder.AppendLine("Repository");
         builder.AppendLine($"  Branch: {status.Manifest.Branch ?? "(detached or unborn)"}");
         builder.AppendLine($"  Baseline: {status.Manifest.BaselineId}");
-        builder.AppendLine($"  HEAD at baseline: {status.Manifest.HeadCommit ?? "(no commit)"}");
+        builder.AppendLine(status.Manifest.DiffBaseReference is null
+            ? $"  HEAD at baseline: {status.Manifest.HeadCommit ?? "(no commit)"}"
+            : $"  Git diff base: {status.Manifest.HeadCommit ?? "(no commit)"} " +
+              $"(merge-base of {status.Manifest.DiffBaseReference})");
+        if (status.Manifest.DiffBaseReference is not null)
+        {
+            builder.AppendLine($"  Captured HEAD: {status.Manifest.CapturedHeadCommit ?? "(no commit)"}");
+        }
         builder.AppendLine($"  Working tree was dirty at baseline: {YesNo(status.Manifest.WorkingTreeDirty)}");
         builder.AppendLine($"  SDK: {status.Manifest.SdkVersion}");
         if (status.Manifest.RepositoryIndexCacheHit is not null)
@@ -45,6 +52,7 @@ public static class OutputFormatter
             $"  Tests: {status.Tests.Total:N0} total / {status.Tests.Passed:N0} passed / " +
             $"{status.Tests.Failed:N0} failed / {status.Tests.Skipped:N0} skipped ({State(status.Tests.State)})");
         builder.AppendLine($"  Test mode: {FormatTestMode(status.Tests)}");
+        builder.AppendLine($"  Coverage: {FormatCoverage(status.Tests)}");
         builder.AppendLine($"  Static analysis: {errors} errors / {warnings} warnings");
         builder.AppendLine($"  Format verification: {State(status.Analysis.DotnetFormat.State)}");
         builder.AppendLine($"  Qodana: {State(status.Analysis.Qodana.State)}");
@@ -60,17 +68,21 @@ public static class OutputFormatter
         var builder = new StringBuilder();
         builder.AppendLine("Verification");
         builder.AppendLine($"  Baseline: {report.BaselineId}");
+        builder.AppendLine($"  Git comparison: {report.GitComparison}");
         builder.AppendLine($"  Build: {State(report.CurrentBuild.State)}");
         builder.AppendLine(
             $"  Tests: {report.CurrentTests.Total:N0} total / {report.CurrentTests.Passed:N0} passed / " +
             $"{report.CurrentTests.Failed:N0} failed / {report.CurrentTests.Skipped:N0} skipped " +
             $"({State(report.CurrentTests.State)})");
         builder.AppendLine($"  Test mode: {FormatTestMode(report.CurrentTests)}");
+        builder.AppendLine($"  Coverage: {FormatCoverage(report.CurrentTests)}");
         builder.AppendLine($"  Format verification: {State(report.CurrentAnalysis.DotnetFormat.State)}");
         builder.AppendLine($"  Qodana: {State(report.CurrentAnalysis.Qodana.State)}");
         builder.AppendLine($"  Execution failures: {YesNo(report.HasExecutionFailures)}");
         builder.AppendLine($"  Regressions: {YesNo(report.HasRegressions)}");
         AppendItems(builder, "Files changed since baseline", report.ChangedFiles);
+        AppendItems(builder, "Change provenance", report.Changes.Select(change =>
+            $"{change.Path} [{ChangeLabel(change.Provenance)}]"));
         AppendItems(builder, "Declarations changed since baseline", report.ChangedSymbols.Select(symbol =>
             $"{symbol.Kind} {FormatSymbolName(symbol)} ({symbol.File}:{symbol.Line})"));
         AppendItems(builder, "New diagnostics", report.NewDiagnostics.Select(FormatDiagnostic));
@@ -85,11 +97,42 @@ public static class OutputFormatter
     {
         var builder = new StringBuilder();
         builder.AppendLine("Affected code");
+        builder.AppendLine($"  Git comparison: {report.GitComparison}");
         AppendItems(builder, "Changed files", report.ChangedFiles);
+        AppendItems(builder, "Change provenance", report.Changes.Select(change =>
+            $"{change.Path} [{ChangeLabel(change.Provenance)}]"));
         AppendItems(builder, "Projects", report.Projects);
         AppendItems(builder, "Changed declarations", report.ChangedSymbols.Select(symbol =>
             $"{symbol.Kind} {FormatSymbolName(symbol)} ({symbol.File}:{symbol.Line})"));
         AppendItems(builder, "Symbols", report.Symbols.Select(symbol =>
+            $"{symbol.Kind} {FormatSymbolName(symbol)} ({symbol.File}:{symbol.Line})"));
+        AppendItems(builder, "Likely affected test projects", report.Tests);
+        AppendItems(builder, "Likely affected test cases", report.TestCases);
+        return builder.ToString().TrimEnd() + Environment.NewLine;
+    }
+
+    public static string FormatReferenceReview(ReferenceReviewReport report)
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine("Reference verification");
+        builder.AppendLine($"  Reference: {report.Reference}");
+        builder.AppendLine($"  Merge base: {report.BaseCommit}");
+        builder.AppendLine($"  HEAD: {report.HeadCommit}");
+        builder.AppendLine($"  Build: {State(report.CurrentBuild.State)}");
+        builder.AppendLine(
+            $"  Tests: {report.CurrentTests.Total:N0} total / {report.CurrentTests.Passed:N0} passed / " +
+            $"{report.CurrentTests.Failed:N0} failed / {report.CurrentTests.Skipped:N0} skipped " +
+            $"({State(report.CurrentTests.State)})");
+        builder.AppendLine($"  Test mode: {FormatTestMode(report.CurrentTests)}");
+        builder.AppendLine($"  Coverage: {FormatCoverage(report.CurrentTests)}");
+        builder.AppendLine($"  Execution failures: {YesNo(report.HasExecutionFailures)}");
+        builder.AppendLine($"  Verification failures: {YesNo(report.HasFailures)}");
+        AppendItems(builder, "Files changed against reference", report.Changes.Select(change =>
+            $"{change.Path} [{ChangeLabel(change.Provenance)}]"));
+        AppendItems(builder, "Affected projects", report.Projects);
+        AppendItems(builder, "Changed declarations", report.ChangedSymbols.Select(symbol =>
+            $"{symbol.Kind} {FormatSymbolName(symbol)} ({symbol.File}:{symbol.Line})"));
+        AppendItems(builder, "Affected symbols", report.Symbols.Select(symbol =>
             $"{symbol.Kind} {FormatSymbolName(symbol)} ({symbol.File}:{symbol.Line})"));
         AppendItems(builder, "Likely affected test projects", report.Tests);
         AppendItems(builder, "Likely affected test cases", report.TestCases);
@@ -112,7 +155,7 @@ public static class OutputFormatter
         return builder.ToString().TrimEnd() + Environment.NewLine;
     }
 
-    public static string FormatDoctor(DoctorReport report)
+    public static string FormatDoctor(DoctorReport report, bool explainGaps = false)
     {
         var builder = new StringBuilder();
         builder.AppendLine("Repository diagnostics");
@@ -134,7 +177,46 @@ public static class OutputFormatter
 
         AppendItems(builder, "Projects", report.Projects.Select(project =>
             $"{project.Name} ({project.Path}) [{string.Join(", ", project.TargetFrameworks)}]"));
+        if (explainGaps)
+        {
+            AppendCompilationGaps(builder, report.CompilationCompleteness);
+        }
+
         return builder.ToString().TrimEnd() + Environment.NewLine;
+    }
+
+    private static void AppendCompilationGaps(
+        StringBuilder builder,
+        IReadOnlyList<CompilationCompletenessRecord> completeness)
+    {
+        builder.AppendLine();
+        builder.AppendLine("Semantic analysis details");
+        if (completeness.Count == 0)
+        {
+            builder.AppendLine("  (none)");
+            return;
+        }
+
+        foreach (var record in completeness
+                     .OrderBy(record => record.Project, StringComparer.Ordinal)
+                     .ThenBy(record => record.TargetFramework, StringComparer.Ordinal))
+        {
+            builder.AppendLine(
+                $"  {record.Project} [{record.TargetFramework ?? "default"}]: {record.State} " +
+                $"({record.LoadedSourceFiles}/{record.ExpectedSourceFiles} sources, " +
+                $"{record.CompilationErrors} compilation errors)");
+            foreach (var diagnostic in record.DiagnosticSummaries)
+            {
+                builder.AppendLine(
+                    $"    {diagnostic.Id} x{diagnostic.Count}" +
+                    (diagnostic.Files.Count == 0 ? string.Empty : $": {string.Join(", ", diagnostic.Files)}"));
+            }
+
+            foreach (var gap in record.Gaps)
+            {
+                builder.AppendLine($"    Gap: {gap}");
+            }
+        }
     }
 
     public static string FormatOwnership(OwnershipExplanation report)
@@ -150,6 +232,39 @@ public static class OutputFormatter
             $"{owner.ProjectPath} — {owner.Reason}" +
             (owner.ItemTypes.Count == 0 ? string.Empty : $" ({string.Join(", ", owner.ItemTypes)})")));
         AppendItems(builder, "Affected projects", report.AffectedProjects);
+        return builder.ToString().TrimEnd() + Environment.NewLine;
+    }
+
+    public static string FormatTrend(RepositoryTrendReport report)
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine("Repository trends");
+        builder.AppendLine($"  Retained points: {report.Points.Count}");
+        if (report.Points.Count == 0)
+        {
+            builder.AppendLine("  No structured report history exists yet. Run 'dev-context report' at least twice.");
+            return builder.ToString();
+        }
+
+        foreach (var point in report.Points)
+        {
+            builder.AppendLine();
+            builder.AppendLine(
+                $"  {point.GeneratedAtUtc:O} [{point.Purpose}/{point.Scope}" +
+                (string.IsNullOrWhiteSpace(point.Target) ? "] " : $"/{point.Target}] ") +
+                point.ReportPath);
+            builder.AppendLine(
+                $"    Diagnostics: {point.DiagnosticCount:N0}{FormatDelta(point.DiagnosticDelta)}; " +
+                $"failing tests: {point.FailingTestCount:N0}{FormatDelta(point.FailingTestDelta)}");
+            builder.AppendLine(
+                $"    Hotspots: {point.HotspotCount:N0}; churn: {point.HotspotChurn:N0}" +
+                $"{FormatDelta(point.HotspotChurnDelta)}; coverage: " +
+                (point.AverageLineCoveragePercent is null
+                    ? "unavailable"
+                    : $"{point.AverageLineCoveragePercent:F1}%" +
+                      FormatDelta(point.AverageLineCoverageDelta, " pp")));
+        }
+
         return builder.ToString().TrimEnd() + Environment.NewLine;
     }
 
@@ -182,11 +297,40 @@ public static class OutputFormatter
     private static string State(ExecutionState state) => state.ToString().ToUpperInvariant();
     private static string YesNo(bool value) => value ? "yes" : "no";
 
+    private static string FormatDelta(int? delta) =>
+        delta is null ? string.Empty : $" ({delta.Value:+0;-0;0})";
+
+    private static string FormatDelta(long? delta) =>
+        delta is null ? string.Empty : $" ({delta.Value:+0;-0;0})";
+
+    private static string FormatDelta(double? delta, string suffix) =>
+        delta is null ? string.Empty : $" ({delta.Value:+0.0;-0.0;0.0}{suffix})";
+
+    private static string ChangeLabel(GitChangeProvenance provenance) => provenance switch
+    {
+        GitChangeProvenance.Committed => "committed",
+        GitChangeProvenance.WorkingTree => "working tree",
+        GitChangeProvenance.Both => "committed + working tree",
+        _ => provenance.ToString()
+    };
+
     private static string FormatTestMode(TestSnapshot tests)
     {
         var completeness = tests.IsComplete ? "complete" : "targeted/incomplete";
         var fullSuite = tests.RanFullSuiteAfterTargetedTests ? ", full suite confirmed" : string.Empty;
         return $"{tests.Mode} ({completeness}{fullSuite})";
+    }
+
+    private static string FormatCoverage(TestSnapshot tests)
+    {
+        if (!tests.CoverageRequested)
+        {
+            return "not requested";
+        }
+
+        return tests.CoverageFiles.Count > 0
+            ? $"{tests.CoverageFiles.Count} Cobertura report(s)"
+            : tests.CoverageDetail ?? "requested, but no report was produced";
     }
 
     private static string FormatSymbolName(SymbolRecord symbol) =>

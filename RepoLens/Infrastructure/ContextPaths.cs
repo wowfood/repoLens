@@ -12,4 +12,5 @@ internal static class ContextPaths
     public static string Summary(string repositoryRoot) => Path.Combine(Root(repositoryRoot), "summary.md");
     public static string Runs(string repositoryRoot) => Path.Combine(Root(repositoryRoot), "runs");
     public static string Cache(string repositoryRoot) => Path.Combine(Root(repositoryRoot), "cache");
+    public static string Reports(string repositoryRoot) => Path.Combine(Root(repositoryRoot), "reports");
 }

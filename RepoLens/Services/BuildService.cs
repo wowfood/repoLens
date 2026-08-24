@@ -104,7 +104,10 @@ internal sealed partial class BuildService(IProcessRunner processRunner)
         }
 
         return Directory.EnumerateFiles(repositoryRoot, "*.sln", SearchOption.TopDirectoryOnly)
+                   .Concat(Directory.EnumerateFiles(repositoryRoot, "*.slnx", SearchOption.TopDirectoryOnly))
                    .Concat(Directory.EnumerateFiles(repositoryRoot, "*.csproj", SearchOption.AllDirectories)
+                       .Concat(Directory.EnumerateFiles(repositoryRoot, "*.fsproj", SearchOption.AllDirectories))
+                       .Concat(Directory.EnumerateFiles(repositoryRoot, "*.vbproj", SearchOption.AllDirectories))
                        .Where(path => !IsGeneratedPath(path)))
                    .Order(StringComparer.OrdinalIgnoreCase)
                    .FirstOrDefault();

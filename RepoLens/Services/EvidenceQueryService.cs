@@ -9,7 +9,8 @@ namespace DevContext.Services;
 internal sealed partial class EvidenceQueryService(
     RepositoryGraphService graphService,
     GitService gitService,
-    ContextStore contextStore)
+    ContextStore contextStore,
+    RepositoryFileFilter fileFilter)
 {
     private const int ReservedPromptTokens = 550;
     private const int MaximumExcerptLines = 60;
@@ -29,6 +30,8 @@ internal sealed partial class EvidenceQueryService(
         Validate(options);
         var graph = await graphService.BuildAsync(repositoryRoot, configuration, cancellationToken);
         IReadOnlyList<string> changedFiles = [];
+        IReadOnlyList<GitFileChange> changes = [];
+        var gitComparison = GitComparisonState.Comparable;
         var queryGaps = new List<string>();
         if (options.ChangedOnly)
         {
@@ -36,7 +39,20 @@ internal sealed partial class EvidenceQueryService(
             {
                 var baseline = await contextStore.ReadStatusAsync(repositoryRoot, cancellationToken);
                 var current = await gitService.CaptureAsync(repositoryRoot, cancellationToken);
-                changedFiles = GitService.ChangedSince(baseline.Git, current);
+                var changeSet = await gitService.ChangesSinceAsync(
+                    repositoryRoot,
+                    baseline.Git,
+                    current,
+                    cancellationToken);
+                changedFiles = changeSet.ChangedFiles;
+                changes = changeSet.Changes;
+                gitComparison = changeSet.Comparison;
+                if (!changeSet.IsComplete)
+                {
+                    queryGaps.Add(
+                        $"Changed-only Git comparison is incomplete: {changeSet.Comparison}. " +
+                        "Recreate the baseline from an ancestor of the current HEAD.");
+                }
             }
             else
             {
@@ -45,6 +61,7 @@ internal sealed partial class EvidenceQueryService(
         }
 
         var terms = QueryTerms(options.Query);
+        var compoundTerms = CompoundIdentifierTerms(options.Query);
         var projectLookup = graph.Repository.Projects.ToDictionary(
             project => project.Path,
             StringComparer.OrdinalIgnoreCase);
@@ -71,14 +88,27 @@ internal sealed partial class EvidenceQueryService(
         var blockBudget = Math.Max(64, options.MaxTokens - ReservedPromptTokens);
         var blocks = new List<EvidenceBlock>();
         var usedTokens = 0;
+        var constrainedToIndexedSymbols = options.ChangedOnly
+                                          || !options.IncludeTests
+                                          || !string.IsNullOrWhiteSpace(options.Project)
+                                          || options.Kinds.Count > 0;
+        var semanticBlockLimit = constrainedToIndexedSymbols || options.MaxResults == 1
+            ? options.MaxResults
+            : options.MaxResults - 1;
         var selectionTruncated = candidates.Count > options.MaxResults;
-        foreach (var candidate in candidates.Values
-                     .OrderByDescending(candidate => candidate.Score)
-                     .ThenBy(candidate => candidate.Symbol.File, StringComparer.Ordinal)
-                     .ThenBy(candidate => candidate.Symbol.Line)
-                     .ThenBy(candidate => candidate.Symbol.Identity, StringComparer.Ordinal)
-                     .Take(options.MaxResults))
+        var orderedCandidates = candidates.Values
+            .OrderByDescending(candidate => candidate.Score)
+            .ThenBy(candidate => candidate.Symbol.File, StringComparer.Ordinal)
+            .ThenBy(candidate => candidate.Symbol.Line)
+            .ThenBy(candidate => candidate.Symbol.Identity, StringComparer.Ordinal)
+            .ToArray();
+        foreach (var candidate in orderedCandidates.Take(options.MaxResults))
         {
+            if (blocks.Count >= semanticBlockLimit)
+            {
+                break;
+            }
+
             cancellationToken.ThrowIfCancellationRequested();
             var remaining = blockBudget - usedTokens;
             if (remaining < 32)
@@ -107,22 +137,43 @@ internal sealed partial class EvidenceQueryService(
             usedTokens += block.ApproximateTokens;
         }
 
-        var constrainedToIndexedSymbols = options.ChangedOnly
-                                          || !options.IncludeTests
-                                          || !string.IsNullOrWhiteSpace(options.Project)
-                                          || options.Kinds.Count > 0;
-        if (!constrainedToIndexedSymbols && blocks.Count < options.MaxResults && usedTokens < blockBudget)
+        if (!constrainedToIndexedSymbols && blocks.Count < options.MaxResults)
         {
+            var remainingTokens = blockBudget - usedTokens;
+            var lexicalBudget = compoundTerms.Count >= 2
+                ? Math.Max(remainingTokens, Math.Min(128, blockBudget / 4))
+                : remainingTokens;
             var lexical = await FindLexicalFileBlocksAsync(
                 repositoryRoot,
                 graph.Repository,
                 terms,
+                compoundTerms,
                 blocks.Select(block => block.File).ToHashSet(StringComparer.OrdinalIgnoreCase),
-                options.MaxResults - blocks.Count,
-                blockBudget - usedTokens,
+                Math.Min(1, options.MaxResults - blocks.Count),
+                lexicalBudget,
                 configuration.Indexing,
                 cancellationToken);
-            blocks.AddRange(lexical.Blocks);
+            if (lexical.Blocks.FirstOrDefault() is { } lexicalBlock)
+            {
+                var replacementTokens = 0;
+                while (lexical.HighConfidence
+                       && replacementTokens < lexicalBlock.ApproximateTokens
+                       && FindDuplicateFileBlockIndex(blocks) is var duplicateIndex
+                       && duplicateIndex >= 0)
+                {
+                    replacementTokens += blocks[duplicateIndex].ApproximateTokens;
+                    usedTokens -= blocks[duplicateIndex].ApproximateTokens;
+                    blocks.RemoveAt(duplicateIndex);
+                }
+
+                if ((lexical.HighConfidence || !lexicalBlock.Truncated)
+                    && usedTokens + lexicalBlock.ApproximateTokens <= blockBudget)
+                {
+                    blocks.Add(lexicalBlock);
+                    usedTokens += lexicalBlock.ApproximateTokens;
+                }
+            }
+
             selectionTruncated |= lexical.Truncated;
         }
 
@@ -270,6 +321,8 @@ internal sealed partial class EvidenceQueryService(
             ShouldAbstain = decision.ShouldAbstain,
             SufficiencyReasons = decision.Reasons,
             ChangedFiles = changedFiles,
+            Changes = changes,
+            GitComparison = gitComparison,
             Truncated = truncated,
             ApproximateTokens = EstimateTokens(prompt),
             Prompt = prompt
@@ -364,16 +417,28 @@ internal sealed partial class EvidenceQueryService(
         var frontier = candidates.Keys.ToHashSet(StringComparer.Ordinal);
         for (var level = 1; level <= depth && frontier.Count > 0; level++)
         {
+            var relatedCandidates = new Dictionary<
+                string,
+                (SymbolRecord Symbol, int Score, List<string> Reasons)>(StringComparer.Ordinal);
             var next = new HashSet<string>(StringComparer.Ordinal);
             foreach (var reference in references)
             {
-                AddRelated(reference.SourceSymbol, reference.TargetSymbol, reference.Relationship, "uses");
-                AddRelated(reference.TargetSymbol, reference.SourceSymbol, reference.Relationship, "used by");
+                CollectRelated(reference.SourceSymbol, reference.TargetSymbol, reference.Relationship, "uses");
+                CollectRelated(reference.TargetSymbol, reference.SourceSymbol, reference.Relationship, "used by");
+            }
+
+            foreach (var (identity, related) in relatedCandidates.OrderBy(entry => entry.Key, StringComparer.Ordinal))
+            {
+                candidates[identity] = new Candidate(
+                    related.Symbol,
+                    Math.Min(1000, related.Score),
+                    related.Reasons.Distinct(StringComparer.Ordinal).ToArray());
+                next.Add(identity);
             }
 
             frontier = next;
 
-            void AddRelated(string anchor, string related, string relationship, string direction)
+            void CollectRelated(string anchor, string related, string relationship, string direction)
             {
                 if (!frontier.Contains(anchor) || candidates.ContainsKey(related)
                                                || !symbols.TryGetValue(related, out var symbol))
@@ -381,11 +446,20 @@ internal sealed partial class EvidenceQueryService(
                     return;
                 }
 
-                candidates[related] = new Candidate(
+                var anchorScore = candidates[anchor].Score;
+                var contribution = Math.Max(
+                    1,
+                    RelationshipWeight(relationship) + Math.Min(200, anchorScore / 4) - level * 15);
+                if (!relatedCandidates.TryGetValue(related, out var accumulated))
+                {
+                    accumulated = (symbol, 0, []);
+                }
+
+                accumulated.Reasons.Add($"graph depth {level}: {direction} '{relationship}'");
+                relatedCandidates[related] = (
                     symbol,
-                    Math.Max(1, RelationshipWeight(relationship) - level * 15),
-                    [$"graph depth {level}: {direction} '{relationship}'"]);
-                next.Add(related);
+                    accumulated.Score + contribution,
+                    accumulated.Reasons);
             }
         }
     }
@@ -465,10 +539,11 @@ internal sealed partial class EvidenceQueryService(
         };
     }
 
-    private static async Task<LexicalSelection> FindLexicalFileBlocksAsync(
+    private async Task<LexicalSelection> FindLexicalFileBlocksAsync(
         string repositoryRoot,
         RepositoryIndex repository,
         IReadOnlyList<string> terms,
+        IReadOnlySet<string> compoundTerms,
         ISet<string> excludedFiles,
         int limit,
         int tokenBudget,
@@ -477,11 +552,13 @@ internal sealed partial class EvidenceQueryService(
     {
         if (limit < 1 || tokenBudget < 32 || terms.Count == 0)
         {
-            return new LexicalSelection([], false);
+            return new LexicalSelection([], false, false);
         }
 
+        var inventory = await fileFilter.GetFilesAsync(repositoryRoot, indexing, cancellationToken);
         var matches = new List<FileMatch>();
-        foreach (var path in EnumerateCandidateFiles(repositoryRoot).Take(indexing.MaxEvidenceFilesScanned))
+        foreach (var path in EnumerateCandidateFiles(repositoryRoot, inventory)
+                     .Take(indexing.MaxEvidenceFilesScanned))
         {
             cancellationToken.ThrowIfCancellationRequested();
             var relative = Path.GetRelativePath(repositoryRoot, path).Replace('\\', '/');
@@ -493,9 +570,12 @@ internal sealed partial class EvidenceQueryService(
             var lines = await File.ReadAllLinesAsync(path, cancellationToken);
             var score = 0;
             var firstLine = 0;
+            var bestLineScore = 0;
             var matchedTerms = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var termCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             for (var index = 0; index < lines.Length; index++)
             {
+                var lineScore = 0;
                 foreach (var term in terms)
                 {
                     if (!lines[index].Contains(term, StringComparison.OrdinalIgnoreCase))
@@ -503,23 +583,35 @@ internal sealed partial class EvidenceQueryService(
                         continue;
                     }
 
-                    score += 10;
-                    matchedTerms.Add(term);
-                    if (firstLine == 0)
+                    var weight = term.Length >= 10 ? 40 : 10;
+                    var count = termCounts.GetValueOrDefault(term);
+                    if (count < 3)
                     {
-                        firstLine = index + 1;
+                        score += weight;
+                        termCounts[term] = count + 1;
                     }
+
+                    lineScore += weight;
+                    matchedTerms.Add(term);
+                }
+
+                if (lineScore > bestLineScore)
+                {
+                    bestLineScore = lineScore;
+                    firstLine = index + 1;
                 }
             }
 
             if (score > 0)
             {
+                score += matchedTerms.Count * 15;
                 matches.Add(new FileMatch(relative, lines, firstLine, score, matchedTerms.Order().ToArray()));
             }
         }
 
         var result = new List<EvidenceBlock>();
         var usedTokens = 0;
+        var highConfidence = false;
         var orderedMatches = matches
             .OrderByDescending(match => match.Score)
             .ThenBy(match => match.File, StringComparer.Ordinal)
@@ -529,9 +621,28 @@ internal sealed partial class EvidenceQueryService(
         {
             var start = Math.Max(1, match.FirstLine - 4);
             var end = Math.Min(match.Lines.Length, match.FirstLine + 5);
-            var text = string.Join(Environment.NewLine, match.Lines[(start - 1)..end]);
+            var excerptLines = match.Lines[(start - 1)..end].ToList();
+            var text = string.Join(Environment.NewLine, excerptLines);
             var blockTokens = EstimateTokens(text) + 16;
-            if (usedTokens + blockTokens > tokenBudget)
+            var remaining = tokenBudget - usedTokens;
+            var excerptTruncated = false;
+            while (blockTokens > remaining && excerptLines.Count > 1)
+            {
+                excerptLines.RemoveAt(excerptLines.Count - 1);
+                end--;
+                text = string.Join(Environment.NewLine, excerptLines);
+                blockTokens = EstimateTokens(text) + 16;
+                excerptTruncated = true;
+            }
+
+            if (blockTokens > remaining && remaining >= 32)
+            {
+                text = text[..Math.Min(text.Length, Math.Max(32, (remaining - 16) * 4))].TrimEnd();
+                blockTokens = EstimateTokens(text) + 16;
+                excerptTruncated = true;
+            }
+
+            if (remaining < 32 || blockTokens > remaining)
             {
                 truncated = true;
                 break;
@@ -540,6 +651,8 @@ internal sealed partial class EvidenceQueryService(
             var project = ProjectOwnershipResolver.Explain(match.File, repository.Projects)
                 .Select(owner => owner.ProjectPath)
                 .FirstOrDefault() ?? "(unowned)";
+            var isTestProject = repository.Projects.FirstOrDefault(candidate =>
+                candidate.Path.Equals(project, StringComparison.OrdinalIgnoreCase))?.IsTestProject == true;
             var contentHash = Hashing.Text(text);
             result.Add(new EvidenceBlock
             {
@@ -552,12 +665,16 @@ internal sealed partial class EvidenceQueryService(
                 ContentHash = contentHash,
                 Text = text,
                 SelectionReasons = [$"text matches: {string.Join(", ", match.Terms)}"],
-                ApproximateTokens = blockTokens
+                ApproximateTokens = blockTokens,
+                Truncated = excerptTruncated
             });
+            highConfidence |= match.Terms.Count(compoundTerms.Contains) >= 2
+                              && Path.GetExtension(match.File).Equals(".cs", StringComparison.OrdinalIgnoreCase)
+                              && !isTestProject;
             usedTokens += blockTokens;
         }
 
-        return new LexicalSelection(result, truncated);
+        return new LexicalSelection(result, truncated, highConfidence);
     }
 
     private static IReadOnlyList<EvidenceRelationship> BuildRelationships(
@@ -707,13 +824,35 @@ internal sealed partial class EvidenceQueryService(
         .Order(StringComparer.Ordinal)
         .ToArray();
 
-    private static IEnumerable<string> EnumerateCandidateFiles(string repositoryRoot) =>
-        Directory.EnumerateFiles(repositoryRoot, "*", SearchOption.AllDirectories)
-            .Where(path => path.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
-                .All(segment => segment is not (".git" or ".dev-context" or ".idea" or "bin" or "obj")))
+    private static IReadOnlySet<string> CompoundIdentifierTerms(string query) => WordPattern()
+        .Matches(query)
+        .Where(match => CamelCasePattern().Matches(match.Value).Count > 1)
+        .Select(match => match.Value.ToLowerInvariant())
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+    private static int FindDuplicateFileBlockIndex(IReadOnlyList<EvidenceBlock> blocks)
+    {
+        for (var index = blocks.Count - 1; index >= 0; index--)
+        {
+            if (blocks.Count(block => block.File.Equals(
+                    blocks[index].File,
+                    StringComparison.OrdinalIgnoreCase)) > 1)
+            {
+                return index;
+            }
+        }
+
+        return -1;
+    }
+
+    private static IEnumerable<string> EnumerateCandidateFiles(
+        string repositoryRoot,
+        RepositoryFileInventory inventory) =>
+        inventory.RelativePaths
             .Where(path => Path.GetExtension(path).ToLowerInvariant() is
-                ".cs" or ".razor" or ".xaml" or ".md" or ".json" or ".csproj" or ".props" or ".targets")
-            .Order(StringComparer.OrdinalIgnoreCase);
+                ".cs" or ".fs" or ".vb" or ".razor" or ".xaml" or ".md" or ".json"
+                or ".csproj" or ".fsproj" or ".vbproj" or ".props" or ".targets")
+            .Select(path => RepositoryFileFilter.ToFullPath(repositoryRoot, path));
 
     private static string ResolveRepositoryPath(string repositoryRoot, string relativePath)
     {
@@ -779,6 +918,16 @@ internal sealed partial class EvidenceQueryService(
                 EvidenceSufficiency.Insufficient,
                 true,
                 ["No repository source evidence matched the query."]);
+        }
+
+        if (gaps.Any(gap => gap.StartsWith(
+                "Changed-only Git comparison is incomplete:",
+                StringComparison.Ordinal)))
+        {
+            return new EvidenceDecision(
+                EvidenceSufficiency.Insufficient,
+                true,
+                ["The baseline commit cannot be compared safely with the current HEAD."]);
         }
 
         var reasons = new List<string>();
@@ -893,5 +1042,8 @@ internal sealed partial class EvidenceQueryService(
         int Score,
         IReadOnlyList<string> Terms);
 
-    private sealed record LexicalSelection(IReadOnlyList<EvidenceBlock> Blocks, bool Truncated);
+    private sealed record LexicalSelection(
+        IReadOnlyList<EvidenceBlock> Blocks,
+        bool Truncated,
+        bool HighConfidence);
 }

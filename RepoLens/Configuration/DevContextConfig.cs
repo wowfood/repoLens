@@ -5,7 +5,7 @@ namespace DevContext.Configuration;
 
 public sealed record DevContextConfig
 {
-    public int Version { get; init; } = 1;
+    public int Version { get; init; } = ConfigLoader.CurrentVersion;
     public string? Solution { get; init; }
     public TestConfig Tests { get; init; } = new();
     public AnalysisConfig Analysis { get; init; } = new();
@@ -20,6 +20,7 @@ public sealed record TestConfig
     public bool Enabled { get; init; } = true;
     public string BaselineMode { get; init; } = "all";
     public string VerifyMode { get; init; } = "affected-first";
+    public bool CollectCoverage { get; init; }
 }
 
 public sealed record AnalysisConfig
@@ -50,6 +51,9 @@ public sealed record CacheConfig
 public sealed record IndexingConfig
 {
     public bool ExecuteSourceGenerators { get; init; } = true;
+    public bool RespectGitignore { get; init; } = true;
+    public IReadOnlyList<string> Exclude { get; init; } = [];
+    public int MaxParallelism { get; init; } = Math.Max(1, Math.Min(Environment.ProcessorCount, 8));
     public int MaxSourceFileBytes { get; init; } = 2 * 1024 * 1024;
     public int MaxEvidenceFileBytes { get; init; } = 512 * 1024;
     public int MaxEvidenceFilesScanned { get; init; } = 20_000;
@@ -57,7 +61,10 @@ public sealed record IndexingConfig
 
 internal static class ConfigLoader
 {
-    public static async Task<(DevContextConfig Config, bool IsNew)> LoadAsync(
+    public const int CurrentVersion = 2;
+    public const int MinimumReadableVersion = 1;
+
+    public static async Task<(DevContextConfig Config, bool IsNew, bool RequiresSave)> LoadAsync(
         string repositoryRoot,
         CancellationToken cancellationToken)
     {
@@ -65,12 +72,13 @@ internal static class ConfigLoader
         if (!File.Exists(path))
         {
             var solution = Directory.EnumerateFiles(repositoryRoot, "*.sln", SearchOption.TopDirectoryOnly)
+                .Concat(Directory.EnumerateFiles(repositoryRoot, "*.slnx", SearchOption.TopDirectoryOnly))
                 .Order(StringComparer.OrdinalIgnoreCase)
                 .Select(candidate => Path.GetRelativePath(repositoryRoot, candidate).Replace('\\', '/'))
                 .FirstOrDefault();
             var newConfig = new DevContextConfig { Solution = solution };
             Validate(newConfig);
-            return (newConfig, true);
+            return (newConfig, true, false);
         }
 
         await using var stream = File.OpenRead(path);
@@ -84,19 +92,33 @@ internal static class ConfigLoader
             throw new InvalidOperationException($"Configuration is empty: {path}");
         }
 
-        if (config.Version != 1)
+        var migrated = Migrate(config, out var requiresSave);
+        Validate(migrated);
+
+        return (migrated, false, requiresSave);
+    }
+
+    public static DevContextConfig Migrate(DevContextConfig config, out bool requiresSave)
+    {
+        if (config.Version is < MinimumReadableVersion or > CurrentVersion)
         {
             throw new InvalidOperationException(
-                $"Unsupported configuration version {config.Version}; expected version 1.");
+                $"Unsupported configuration version {config.Version}; this version reads " +
+                $"versions {MinimumReadableVersion}-{CurrentVersion}.");
         }
 
-        Validate(config);
-
-        return (config, false);
+        requiresSave = config.Version < CurrentVersion;
+        return requiresSave ? config with { Version = CurrentVersion } : config;
     }
 
     internal static void Validate(DevContextConfig config)
     {
+        if (config.Version != CurrentVersion)
+        {
+            throw new InvalidOperationException(
+                $"Configuration must be migrated to version {CurrentVersion} before validation.");
+        }
+
         if (config.Tests.BaselineMode is not ("all" or "none"))
         {
             throw new InvalidOperationException(
@@ -121,12 +143,46 @@ internal static class ConfigLoader
                 "analysis.qodanaCommand must be non-empty when Qodana is enabled.");
         }
 
+        if (config.Indexing.MaxParallelism is < 1 or > 64)
+        {
+            throw new InvalidOperationException("indexing.maxParallelism must be between 1 and 64.");
+        }
+
         if (config.Indexing.MaxSourceFileBytes < 1024
             || config.Indexing.MaxEvidenceFileBytes < 1024
             || config.Indexing.MaxEvidenceFilesScanned < 1)
         {
             throw new InvalidOperationException(
                 "indexing file-size limits must be at least 1024 bytes and maxEvidenceFilesScanned must be positive.");
+        }
+
+        if (config.Indexing.Exclude is null)
+        {
+            throw new InvalidOperationException("indexing.exclude must be an array of repository-relative globs.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(config.Solution)
+            && Path.GetExtension(config.Solution).ToLowerInvariant() is not (".sln" or ".slnx" or ".slnf"))
+        {
+            throw new InvalidOperationException("solution must reference a .sln, .slnx, or .slnf file.");
+        }
+
+        foreach (var pattern in config.Indexing.Exclude)
+        {
+            if (string.IsNullOrWhiteSpace(pattern))
+            {
+                throw new InvalidOperationException("indexing.exclude entries must be non-empty repository-relative globs.");
+            }
+
+            var normalized = pattern.Replace('\\', '/');
+            if (Path.IsPathRooted(pattern)
+                || normalized.StartsWith("/", StringComparison.Ordinal)
+                || normalized.Length >= 2 && char.IsAsciiLetter(normalized[0]) && normalized[1] == ':'
+                || normalized.Split('/', StringSplitOptions.RemoveEmptyEntries).Contains("..", StringComparer.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"indexing.exclude entries must not escape the repository: {pattern}");
+            }
         }
     }
 }

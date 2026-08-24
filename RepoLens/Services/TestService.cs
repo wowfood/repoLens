@@ -13,6 +13,7 @@ internal sealed record TestBatch(
     long DurationMilliseconds,
     IReadOnlyList<TestOutcomeRecord> Outcomes,
     IReadOnlyList<string> Projects,
+    IReadOnlyList<string> CoverageFiles,
     string? Detail,
     string RawLog);
 
@@ -31,16 +32,22 @@ internal sealed class TestService(IProcessRunner processRunner)
             return (Skipped(
                 plan.Mode,
                 "Test execution is disabled by repository configuration.",
-                false), string.Empty);
+                false,
+                config.Tests.CollectCoverage), string.Empty);
         }
 
         var testProjects = projects.Projects.Where(project => project.IsTestProject).ToArray();
         if (testProjects.Length == 0)
         {
-            return (Skipped(plan.Mode, "No test projects were discovered.", true), string.Empty);
+            return (Skipped(
+                plan.Mode,
+                "No test projects were discovered.",
+                true,
+                config.Tests.CollectCoverage), string.Empty);
         }
 
         var resultRoot = Path.Combine(ContextPaths.Runs(repositoryRoot), runId, "tests");
+        var coverageRoot = Path.Combine(ContextPaths.Runs(repositoryRoot), runId, "coverage");
         Directory.CreateDirectory(resultRoot);
         try
         {
@@ -51,8 +58,16 @@ internal sealed class TestService(IProcessRunner processRunner)
                     testProjects,
                     new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase),
                     Path.Combine(resultRoot, "all"),
+                    coverageRoot,
+                    "all",
+                    config.Tests.CollectCoverage,
                     cancellationToken);
-                return (ToSnapshot(allBatch, plan.Mode, true, false), allBatch.RawLog);
+                return (ToSnapshot(
+                    allBatch,
+                    plan.Mode,
+                    true,
+                    false,
+                    config.Tests.CollectCoverage), allBatch.RawLog);
             }
 
             var affectedProjects = testProjects
@@ -67,7 +82,8 @@ internal sealed class TestService(IProcessRunner processRunner)
                     return (Skipped(
                         plan.Mode,
                         "No affected test projects were identified.",
-                        false), string.Empty);
+                        false,
+                        config.Tests.CollectCoverage), string.Empty);
                 }
 
                 var fullWithoutTargets = await RunBatchAsync(
@@ -75,8 +91,16 @@ internal sealed class TestService(IProcessRunner processRunner)
                     testProjects,
                     new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase),
                     Path.Combine(resultRoot, "full"),
+                    coverageRoot,
+                    "full",
+                    config.Tests.CollectCoverage,
                     cancellationToken);
-                return (ToSnapshot(fullWithoutTargets, plan.Mode, true, false), fullWithoutTargets.RawLog);
+                return (ToSnapshot(
+                    fullWithoutTargets,
+                    plan.Mode,
+                    true,
+                    false,
+                    config.Tests.CollectCoverage), fullWithoutTargets.RawLog);
             }
 
             var filters = BuildFilters(plan.Affected!, affectedProjects);
@@ -85,12 +109,20 @@ internal sealed class TestService(IProcessRunner processRunner)
                 affectedProjects,
                 filters,
                 Path.Combine(resultRoot, "targeted"),
+                coverageRoot,
+                "targeted",
+                config.Tests.CollectCoverage,
                 cancellationToken);
             var targetedFailed = targeted.State is ExecutionState.Failed or ExecutionState.Unavailable
                                  || targeted.Outcomes.Any(outcome => IsFailed(outcome.Outcome));
             if (plan.Mode == "affected-only" || targetedFailed)
             {
-                return (ToSnapshot(targeted, plan.Mode, false, false), targeted.RawLog);
+                return (ToSnapshot(
+                    targeted,
+                    plan.Mode,
+                    false,
+                    false,
+                    config.Tests.CollectCoverage), targeted.RawLog);
             }
 
             var fullSuite = await RunBatchAsync(
@@ -98,6 +130,9 @@ internal sealed class TestService(IProcessRunner processRunner)
                 testProjects,
                 new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase),
                 Path.Combine(resultRoot, "full"),
+                coverageRoot,
+                "full",
+                config.Tests.CollectCoverage,
                 cancellationToken);
             var combined = fullSuite with
             {
@@ -111,7 +146,12 @@ internal sealed class TestService(IProcessRunner processRunner)
                     new[] { targeted.RawLog, fullSuite.RawLog }
                         .Where(value => !string.IsNullOrWhiteSpace(value)))
             };
-            return (ToSnapshot(combined, plan.Mode, true, true), combined.RawLog);
+            return (ToSnapshot(
+                combined,
+                plan.Mode,
+                true,
+                true,
+                config.Tests.CollectCoverage), combined.RawLog);
         }
         finally
         {
@@ -127,12 +167,16 @@ internal sealed class TestService(IProcessRunner processRunner)
         IReadOnlyList<ProjectRecord> testProjects,
         IReadOnlyDictionary<string, IReadOnlyList<string>> filters,
         string resultDirectory,
+        string coverageDirectory,
+        string batchName,
+        bool collectCoverage,
         CancellationToken cancellationToken)
     {
         Directory.CreateDirectory(resultDirectory);
         var outcomes = new Dictionary<string, TestOutcomeRecord>(StringComparer.Ordinal);
         var logs = new List<string>();
         var executedProjects = new List<string>();
+        var coverageFiles = new List<string>();
         var totalDuration = 0L;
         var state = ExecutionState.Succeeded;
         string? detail = null;
@@ -143,6 +187,10 @@ internal sealed class TestService(IProcessRunner processRunner)
                 repositoryRoot,
                 project.Path.Replace('/', Path.DirectorySeparatorChar)));
             var resultFile = SanitizeFileName(project.Name) + ".trx";
+            var projectResultDirectory = Path.Combine(
+                resultDirectory,
+                $"{SanitizeFileName(project.Name)}-{Hashing.Text(project.Path)[..8]}");
+            Directory.CreateDirectory(projectResultDirectory);
             var arguments = new List<string>
             {
                 "test",
@@ -152,8 +200,13 @@ internal sealed class TestService(IProcessRunner processRunner)
                 "--logger",
                 $"trx;LogFileName={resultFile}",
                 "--results-directory",
-                resultDirectory
+                projectResultDirectory
             };
+            if (collectCoverage)
+            {
+                arguments.Add("--collect");
+                arguments.Add("XPlat Code Coverage");
+            }
             if (filters.TryGetValue(project.Path, out var testCases) && testCases.Count > 0)
             {
                 arguments.Add("--filter");
@@ -176,7 +229,27 @@ internal sealed class TestService(IProcessRunner processRunner)
                 detail ??= FirstUsefulLine(result.StandardError, result.StandardOutput);
             }
 
-            var trxPath = Directory.EnumerateFiles(resultDirectory, resultFile, SearchOption.AllDirectories)
+            if (collectCoverage)
+            {
+                Directory.CreateDirectory(coverageDirectory);
+                var reports = Directory.EnumerateFiles(
+                        projectResultDirectory,
+                        "*.cobertura.xml",
+                        SearchOption.AllDirectories)
+                    .Order(StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+                for (var reportIndex = 0; reportIndex < reports.Length; reportIndex++)
+                {
+                    var destination = Path.Combine(
+                        coverageDirectory,
+                        $"{batchName}-{SanitizeFileName(project.Name)}-{Hashing.Text(project.Path)[..8]}-" +
+                        $"{reportIndex + 1}.cobertura.xml");
+                    File.Copy(reports[reportIndex], destination, true);
+                    coverageFiles.Add(Path.GetRelativePath(repositoryRoot, destination).Replace('\\', '/'));
+                }
+            }
+
+            var trxPath = Directory.EnumerateFiles(projectResultDirectory, resultFile, SearchOption.AllDirectories)
                 .FirstOrDefault();
             if (trxPath is null)
             {
@@ -194,6 +267,7 @@ internal sealed class TestService(IProcessRunner processRunner)
             totalDuration,
             outcomes.Values.OrderBy(outcome => outcome.Identity, StringComparer.Ordinal).ToArray(),
             executedProjects.Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.Ordinal).ToArray(),
+            coverageFiles.Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.Ordinal).ToArray(),
             detail,
             string.Join(Environment.NewLine, logs.Where(value => !string.IsNullOrWhiteSpace(value))));
     }
@@ -239,7 +313,8 @@ internal sealed class TestService(IProcessRunner processRunner)
         TestBatch batch,
         string mode,
         bool isComplete,
-        bool ranFullSuiteAfterTargetedTests)
+        bool ranFullSuiteAfterTargetedTests,
+        bool coverageRequested)
     {
         return new TestSnapshot
         {
@@ -254,7 +329,12 @@ internal sealed class TestService(IProcessRunner processRunner)
             Mode = mode,
             IsComplete = isComplete,
             RanFullSuiteAfterTargetedTests = ranFullSuiteAfterTargetedTests,
-            ProjectsExecuted = batch.Projects
+            ProjectsExecuted = batch.Projects,
+            CoverageRequested = coverageRequested,
+            CoverageFiles = batch.CoverageFiles,
+            CoverageDetail = coverageRequested && batch.CoverageFiles.Count == 0
+                ? "XPlat Code Coverage produced no Cobertura report. Ensure each test project references a compatible Coverlet collector."
+                : null
         };
     }
 
@@ -311,20 +391,27 @@ internal sealed class TestService(IProcessRunner processRunner)
             ? (long)duration.TotalMilliseconds
             : 0;
 
-    private static TestSnapshot Skipped(string mode, string detail, bool isComplete) => new()
-    {
-        State = ExecutionState.Skipped,
-        Total = 0,
-        Passed = 0,
-        Failed = 0,
-        Skipped = 0,
-        DurationMilliseconds = 0,
-        Outcomes = [],
-        Detail = detail,
-        Mode = mode,
-        IsComplete = isComplete,
-        ProjectsExecuted = []
-    };
+    private static TestSnapshot Skipped(
+        string mode,
+        string detail,
+        bool isComplete,
+        bool coverageRequested) => new()
+        {
+            State = ExecutionState.Skipped,
+            Total = 0,
+            Passed = 0,
+            Failed = 0,
+            Skipped = 0,
+            DurationMilliseconds = 0,
+            Outcomes = [],
+            Detail = detail,
+            Mode = mode,
+            IsComplete = isComplete,
+            ProjectsExecuted = [],
+            CoverageRequested = coverageRequested,
+            CoverageFiles = [],
+            CoverageDetail = coverageRequested ? "Coverage was not collected because tests did not run." : null
+        };
 
     private static string SanitizeFileName(string value) =>
         string.Concat(value.Select(character => Path.GetInvalidFileNameChars().Contains(character) ? '_' : character));

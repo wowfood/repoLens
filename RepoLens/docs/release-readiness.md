@@ -1,7 +1,7 @@
 # Release readiness
 
-RepoLens 0.7 establishes the evidence-fidelity surface intended to mature into 1.0. A release candidate is
-ready only when the following gates pass from a clean checkout on a supported Windows runner.
+RepoLens 0.11 establishes the release-hardening surface intended to mature into 1.0. A release
+candidate is ready only when the following gates pass from clean Windows, Linux, and macOS runners.
 
 ## Automated gates
 
@@ -21,19 +21,23 @@ release requirements.
 
 - Public API target: .NET 8 or later.
 - CLI target: .NET 10.
-- Current persisted schema: 8.
-- Readable persisted schemas: 5 through 8. Artifacts outside that window fail explicitly.
-- CLI/API package version: 0.7.0.
+- Current persisted schema: 10.
+- Readable persisted schemas: 5 through 10. Artifacts outside that window fail explicitly.
+- Configuration: v2 current, v1 read/migrate supported.
+- CLI/API package version: 0.11.0.
+- MCP transport: stdio through the official C# SDK, exposing typed structured results for the
+  seven supported repository tools.
 
-Before publishing 1.0, freeze public record/property names, document the deprecation policy, add a
-schema migration fixture for every readable version, and run the package from a clean net8 consumer
-using only the produced NuGet feed.
+Executable manifest migration fixtures now cover every readable version, and `dev-context schema`
+publishes the current persisted-document contracts. Before publishing 1.0, freeze public
+record/property names, document the deprecation policy, and complete the manual product matrix
+below using only produced packages.
 
 ## Manual release checks
 
 1. Install `DevContext.Cli` from the produced local package into a clean tool path.
-2. Run `doctor`, `baseline`, `affected`, a filtered `query`, `benchmark`, and `verify` against one
-   Blazor, WPF, and MAUI repository.
+2. Run `doctor`, coverage-enabled `baseline`, `affected`, a filtered `query`, `benchmark`, `mcp`,
+   `report`, `trend`, and `verify` against one Blazor, WPF, and MAUI repository.
 3. Confirm per-target completeness and generator gaps in JSON; never interpret a partial analysis
    as proof that no dependency exists.
 4. Confirm `doctor` displays the source-generator trust warning. Disable generator execution and

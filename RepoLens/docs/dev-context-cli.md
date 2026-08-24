@@ -36,8 +36,16 @@ For a repeatable behavioral test, use the isolated smoke harness documented in
 Create the immutable baseline before changing source:
 
 ```powershell
+dev-context init
 dev-context baseline
 dev-context status
+```
+
+For an existing feature branch or CI review, compare directly with another ref without creating a
+baseline:
+
+```powershell
+dev-context verify --against origin/main
 ```
 
 During implementation, inspect likely impact:
@@ -47,6 +55,7 @@ dev-context affected
 dev-context explain src/App/Components/Dashboard.razor
 dev-context context change
 dev-context query "change dashboard song refresh and its focused tests" --max-tokens 3000
+dev-context refs "DashboardViewModel.RefreshAsync" --relation callers
 dev-context benchmark RepoLens/benchmarks/evidence-corpus.json
 ```
 
@@ -66,6 +75,13 @@ Every significant command accepts `--format text` (the default) or `--format jso
 JSON written to standard output.
 
 ## Commands
+
+### `init`
+
+Writes a validated `.dev-context/config.json` without creating a baseline. If current configuration
+already exists, it reports that fact and leaves the file unchanged. A readable v1 configuration is
+migrated to v2 atomically; new fields retain their backward-compatible defaults. This makes
+repository scope settings reviewable before the first capture.
 
 ### `baseline`
 
@@ -87,6 +103,16 @@ Captures:
 The pending baseline is written separately and moved into place only after capture succeeds.
 Source cleanup is never invoked by this command.
 
+When `solution` is configured, project discovery starts from projects explicitly included by
+`.sln`, `.slnx`, or `.slnf` and then follows their transitive `ProjectReference` closure. Other
+on-disk projects are not silently added. Without a configured solution, repository project
+discovery remains the fallback.
+
+`baseline --from <ref>` stores `merge-base(<ref>, HEAD)` as the Git diff base while capturing the
+current branch's health and repository graph as the regression baseline. This is useful when work
+already exists on a feature branch but later task commands should continue to report the whole
+branch delta. Status shows both the merge base and the HEAD that was captured.
+
 ### `status`
 
 Reads stored results only. It does not rebuild or retest. Text output is deliberately bounded so
@@ -97,7 +123,8 @@ it can be inserted into an agent context without dumping every diagnostic or fil
 Rebuilds, retests, and reruns enabled analysis providers. It compares stable diagnostic and test
 identities and reports:
 
-- working-tree files whose status or contents changed after the baseline;
+- committed files changed between the baseline HEAD and current HEAD, plus working-tree files whose
+  status or contents changed after the baseline;
 - declarations changed within those files;
 - new and resolved diagnostics;
 - new, existing, and resolved failing tests;
@@ -118,6 +145,17 @@ The configured verification modes are:
 Targeted/incomplete runs never report a pre-existing failing test as resolved unless that exact
 test was executed and passed.
 
+Every changed file includes `committed`, `working tree`, or `committed + working tree` provenance.
+Before reading a commit range, RepoLens verifies that the baseline HEAD is still an ancestor of the
+current HEAD. A rebase, reset, or history rewrite produces `BaselineDiverged`, marks verification as
+incomplete, and returns the usage/failure exit code instead of silently reporting a partial delta.
+
+`verify --against <ref>` is a stateless branch-review mode. It calculates the merge base, analyzes
+committed and working-tree changes, runs current build/analysis and affected-first tests, and
+returns a typed `ReferenceReviewReport`. It does not read, create, or replace an immutable
+baseline, which makes it suitable for a clean CI checkout. Because there is no historical health
+snapshot, failures describe current verification health rather than baseline regressions.
+
 ### `affected`
 
 Maps files changed after the baseline to containing projects and declared symbols. Explicitly
@@ -134,12 +172,28 @@ cases are emitted as fully qualified names suitable for VSTest filters. Razor an
 currently receive project-level ownership and dependency propagation rather than fabricated C#
 declaration or symbol results.
 
+Committed changes are included even when the working tree is clean. Text and JSON output expose
+the same provenance and comparison state as `verify`.
+
 ### `doctor`
 
-Checks SDK availability, NuGet configuration readability, the configured solution, evaluated
-project discovery, enabled optional analysis providers, and baseline availability. It does not
+Checks SDK availability, NuGet configuration readability, the configured solution, effective
+repository scope, evaluated project discovery, enabled optional analysis providers, and baseline availability. It does not
 create a baseline. Warnings such as an inaccessible user `NuGet.Config` remain distinguishable
-from failures that prevent repository evaluation.
+from failures that prevent repository evaluation. Repository scope reports whether `.gitignore`
+was applied, the selected file count, and both built-in and configured exclude globs so unexpected
+omissions or inclusions are visible.
+
+Project discovery includes `.csproj`, `.fsproj`, and `.vbproj`. F# and Visual Basic projects use
+evaluated MSBuild inputs for ownership, project dependencies, and test selection. Their
+compilation-completeness records remain explicitly partial because the Roslyn C# declaration and
+relationship index does not apply to those languages.
+
+Doctor uses the repository graph cache by default and reports `HIT` or `MISS`; use `--no-cache`
+only when diagnosing stale or environment-sensitive graph construction. `--explain-gaps` prints
+every project's framework, source-load counts, top semantic diagnostic IDs with affected files,
+and explicit gap messages. The same structured detail is always available in JSON under
+`compilationCompleteness`.
 
 ### `explain <path>`
 
@@ -157,9 +211,12 @@ dev-context report architecture --output reports/architecture.md
 ```
 
 Scopes are `automatic`, `full`, `changed`, `project`, and `path`. Optional `--coverage` accepts a
-Cobertura XML report. `--history-months`, `--max-hotspots`, and `--max-symbols` bound work and
-output. The typed API and JSON context include an approximate token count; `report` prints artifact
-character and token estimates and retains 20 default-directory reports unless `--retain`
+Cobertura XML report and takes precedence over automatically collected coverage. When
+`tests.collectCoverage` is enabled, baseline/verification test runs request the cross-platform
+Coverlet collector and persist its reports for hotspot ranking. Test projects must reference a
+compatible Coverlet collector. `--history-months`, `--max-hotspots`, and `--max-symbols` bound work
+and output. The typed API and JSON context include an approximate token count; `report` prints
+artifact character and token estimates and retains 20 default-directory reports unless `--retain`
 changes the bound.
 
 Architecture and change Markdown include compact type details. JSON additionally exposes the full
@@ -192,13 +249,95 @@ require or create a baseline; changed-only selection reads but never replaces th
 `--exclude-tests`, `--project <name-or-path>`, and repeatable `--kind <kind,...>` filters further
 constrain seeds; graph traversal may still add directly related declarations. When filters are
 active, unconstrained lexical fallback is disabled so it cannot bypass the requested scope.
+Committed changes after the baseline participate in this filter. If Git history diverged,
+changed-only evidence is marked insufficient and tells consumers to abstain.
+
+### `refs <symbol-or-file:line>`
+
+Resolves one exact symbol and filters the typed, direction-aware dependency graph without lexical
+ranking:
+
+```powershell
+dev-context refs "EvidenceQueryService.EvaluateSufficiency" --relation callers
+dev-context refs "IProcessRunner" --relation implementers
+dev-context refs "RepoLens/Services/GitService.cs:89" --relation tests-covering
+```
+
+Supported relations are `callers`, `callees`, `implementers`, `implementations`, `overrides`,
+`subtypes`, `constructors-of`, `readers`, `writers`, `tests-covering`, and `injected-into`.
+Fully-qualified names, unique bare names, and repository-relative `file:line` locations are
+accepted. Ambiguity is returned as a candidate list rather than guessed away. Results retain edge
+confidence, origin, target framework, and exact evidence spans; output is deterministic and bounded
+by `--max-results` and `--max-tokens`.
+
+An empty result is proof of absence only when the relevant compilation records are complete.
+Otherwise the result is insufficient and requires abstention, preserving the same honesty contract
+as `query`.
+
+### `mcp`
+
+Starts a local Model Context Protocol server over standard input/output. The server exposes the
+existing typed API results as structured content through these tools:
+
+- `status` — stored baseline health without running work;
+- `affected` — changed files, impacted declarations/projects, and likely tests;
+- `explain` — project ownership for a path;
+- `context` — bounded change, architecture, build, or risk context;
+- `query` — token-bounded source evidence for a task;
+- `refs` — exact structural reference relationships; and
+- `verify` — an explicit build/test/analyzer regression check.
+
+`verify` is deliberately not invoked by any read-only tool. It can be slow and writes normal
+build/test artifacts, so an MCP client or agent must choose it explicitly.
+
+A typical MCP client entry is:
+
+```json
+{
+  "mcpServers": {
+    "repolens": {
+      "command": "dev-context",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Configure the client to launch the process with the target repository as its working directory.
+The process holds a single `DevContextApi` session and graph in memory across calls. Graph-backed
+tools still recompute the existing deterministic input hash before reuse, so source, project,
+solution, SDK, or configuration changes invalidate stale data. Protocol messages are the only
+content written to standard output; `--verbose` diagnostics remain on standard error.
 
 ### `benchmark <corpus.json>`
 
 Runs every JSON `EvidenceBenchmarkCase` twice and reports expected-file recall/precision,
 missing relationships, sufficiency/abstention conformance, approximate tokens, cold/warm latency,
 and deterministic output. It exits `0` only when every expected file/relationship and optional
-evidence decision is satisfied within budget and both runs match; an acceptance failure exits `1`.
+evidence decision is satisfied within budget and both runs match; an acceptance failure exits `4`.
+
+### `trend`
+
+Reads the structured JSON sidecars retained beside default Markdown reports and compares
+diagnostic count, failing-test count, hotspot churn, and average hotspot line coverage. Deltas are
+computed only against an earlier report with the same purpose, scope, and target.
+
+```powershell
+dev-context report risk
+dev-context trend --max-results 20
+dev-context trend --format json
+```
+
+### `schema [document]`
+
+Emits draft 2020-12 JSON Schema without requiring a Git repository. With no document operand the
+command emits the complete persisted-document catalog; use a name such as `tests`, `configuration`,
+or `verification` for one contract. `--output` also writes the emitted JSON to a file.
+
+```powershell
+dev-context schema
+dev-context schema tests --output schemas/tests.schema.json
+```
 
 ### `clean`
 
@@ -213,16 +352,18 @@ Deletes `baseline/`, `current/`, `indexes/`, `cache/`, retained runs, and `summa
 
 ## Configuration
 
-The first `baseline` creates `.dev-context/config.json` if it does not exist. A typical file is:
+Run `dev-context init` to create `.dev-context/config.json` explicitly. The first `baseline` also
+creates it when necessary for backward compatibility. A typical file is:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "solution": "RepoLens.sln",
   "tests": {
     "enabled": true,
     "baselineMode": "all",
-    "verifyMode": "affected-first"
+    "verifyMode": "affected-first",
+    "collectCoverage": false
   },
   "analysis": {
     "roslyn": true,
@@ -243,6 +384,9 @@ The first `baseline` creates `.dev-context/config.json` if it does not exist. A 
   },
   "indexing": {
     "executeSourceGenerators": true,
+    "respectGitignore": true,
+    "exclude": [],
+    "maxParallelism": 8,
     "maxSourceFileBytes": 2097152,
     "maxEvidenceFileBytes": 524288,
     "maxEvidenceFilesScanned": 20000
@@ -252,6 +396,20 @@ The first `baseline` creates `.dev-context/config.json` if it does not exist. A 
 
 Raw build, test, and analysis logs are omitted by default. Enable `retainRawLogs` only when they
 are required for investigation. Normalized machine-readable results are always persisted.
+Coverage collection is opt-in because it adds instrumentation time and depends on the test
+project's collector package. Coverage XML is retained even when raw logs and TRX files are removed.
+Configuration v1 remains readable and is rewritten as v2 by `init` or the next baseline save;
+unknown older or newer versions fail explicitly.
+
+Repository discovery, graph hashing, project indexing, and lexical evidence all use the same file
+inventory. With `respectGitignore` enabled, tracked files plus untracked, non-ignored files are
+selected using Git's own ignore rules. `exclude` adds repository-relative globs such as
+`["artifacts/**", "samples/**"]`. Built output and tool state under `bin`, `obj`, `.git`,
+`.idea`, and `.dev-context` remain excluded regardless of these settings. Set
+`respectGitignore` to `false` only when ignored source is intentionally part of the analysis.
+`maxParallelism` bounds concurrent project evaluation and Roslyn indexing work from 1 through 64.
+Its default is the smaller of the machine's processor count and 8, with a minimum of 1; the sample
+shows the maximum default value.
 
 ## Generated layout
 
@@ -280,16 +438,24 @@ are required for investigation. Normalized machine-readable results are always p
     projects.json
     symbols.json
     dependencies.json
+    project-entries/
+      <project-path-hash>.json
   reports/
     <timestamp>-<purpose>.md
+    <timestamp>-<purpose>.trend.json
+  runs/
+    <run-id>/coverage/*.cobertura.xml
   summary.md
 ```
 
-Every stored document has a schema version. Schema v8 adds evidence sufficiency/abstention,
+Every stored document has a schema version. Schema v10 adds persisted coverage provenance and
+structured retained-report trend points. Schema v9 adds commit-aware change provenance, an
+explicit Git comparison state, solution-scoped multi-language ownership, and structured semantic
+diagnostic summaries. Schema v8 adds evidence sufficiency/abstention,
 relationship origin/framework provenance, exact evidence spans, and local-function symbols.
 Schema v7 adds per-target compilation/reference
 records, generated-source provenance, richer member/markup relationships, and filtered evidence.
-Readers reject schemas outside their declared compatibility window (currently v5-v8). Schema v6 adds resolved metadata-reference provenance,
+Readers reject schemas outside their declared compatibility window (currently v5-v10). Schema v6 adds resolved metadata-reference provenance,
 semantic-compilation completeness, source end lines, and evidence bundles. Schema v5 added rich
 source type/member definitions; schema v4 introduced evaluated MSBuild item provenance and richer
 semantic type relationships.
@@ -297,17 +463,21 @@ Arrays are sorted before persistence wherever their source order is not meaningf
 identities intentionally exclude line/column numbers so unrelated line movement does not
 manufacture a new diagnostic.
 
-The graph cache key includes the schema, SDK version, configuration, repository file inventory,
+The graph cache key includes the schema, SDK version, configuration, filtered repository file inventory,
 solution/project/build files, and C# source contents. The inventory invalidates ownership when
 project items are added, removed, or renamed without unnecessarily hashing large content assets.
-Generated output, Git internals, IDE state, and `.dev-context/` are excluded. Cache entries are
-replaced atomically and invalidated whenever a relevant input changes.
+Git-ignored paths, configured excludes, generated output, Git internals, IDE state, and
+`.dev-context/` are excluded. On an exact cache miss, matching per-project entries are reused.
+A changed project and its reverse project-reference dependents are rebuilt; independent projects
+remain cached. `doctor` reports the reuse/rebuild counts. Cache entries are replaced atomically.
 
 ## Exit codes
 
 - `0`: command completed and verification found no regressions.
 - `1`: verification completed and found regressions.
 - `2`: usage, configuration, repository, or external-command failure.
+- `3`: `query` or `refs` completed but evidence was insufficient and the result requires abstention.
+- `4`: the retrieval benchmark completed but failed an acceptance criterion.
 
 An unavailable command, a command execution failure, analyzer findings, and a repository
 build/test failure remain separate machine-readable states. In particular, configured analysis

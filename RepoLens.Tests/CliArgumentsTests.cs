@@ -16,6 +16,35 @@ public sealed class CliArgumentsTests
     }
 
     [TestMethod]
+    public void Parse_AcceptsGitReferenceOptions()
+    {
+        var baseline = CliArguments.Parse(["baseline", "--from", "origin/main"]);
+        var review = CliArguments.Parse(["verify", "--against", "main"]);
+
+        Assert.AreEqual("origin/main", baseline.FromReference);
+        Assert.AreEqual("main", review.AgainstReference);
+    }
+
+    [TestMethod]
+    public void Parse_AcceptsDoctorDiagnosticOptions()
+    {
+        var result = CliArguments.Parse(["doctor", "--explain-gaps", "--no-cache"]);
+
+        Assert.IsTrue(result.ExplainGaps);
+        Assert.IsTrue(result.NoCache);
+    }
+
+    [TestMethod]
+    public void Parse_AcceptsStructuralReferenceRelation()
+    {
+        var result = CliArguments.Parse(
+            ["refs", "EvidenceQueryService.EvaluateSufficiency", "--relation", "tests-covering"]);
+
+        Assert.AreEqual("EvidenceQueryService.EvaluateSufficiency", result.Target);
+        Assert.AreEqual("tests-covering", result.Relation);
+    }
+
+    [TestMethod]
     public void Parse_RejectsUnknownOption()
     {
         Assert.Throws<CliUsageException>(() => CliArguments.Parse(["baseline", "--mystery"]));

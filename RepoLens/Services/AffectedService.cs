@@ -18,12 +18,17 @@ internal sealed class AffectedService(
             repositoryRoot,
             cancellationToken);
         var currentGit = await gitService.CaptureAsync(repositoryRoot, cancellationToken);
+        var changes = await gitService.ChangesSinceAsync(
+            repositoryRoot,
+            baseline.Git,
+            currentGit,
+            cancellationToken);
         var currentGraph = await graphService.BuildAsync(repositoryRoot, config, cancellationToken);
         return AffectedCalculator.Calculate(
             baseline,
             baselineSymbols,
             baselineDependencies,
-            currentGit,
-            currentGraph);
+            currentGraph,
+            changes);
     }
 }

@@ -20,6 +20,10 @@ internal static class SymbolIndexer
         IReadOnlyList<CompilationCompletenessRecord> Completeness,
         IReadOnlyList<GeneratedSourceRecord> GeneratedSources);
 
+    private sealed record DeclarationIndex(
+        IReadOnlyList<SymbolRecord> Symbols,
+        IReadOnlyDictionary<ISymbol, SymbolRecord> DeclaredSymbols);
+
     private sealed record GeneratorExecution(
         CSharpCompilation Compilation,
         int Discovered,
@@ -40,45 +44,88 @@ internal static class SymbolIndexer
         string repositoryRoot,
         RepositoryIndex projects,
         IndexingConfig indexing,
+        CancellationToken cancellationToken) =>
+        await BuildAsync(repositoryRoot, projects, indexing, null, cancellationToken);
+
+    internal static async Task<(SymbolIndex Symbols, DependencyIndex Dependencies)> BuildAsync(
+        string repositoryRoot,
+        RepositoryIndex projects,
+        IndexingConfig indexing,
+        IReadOnlySet<string>? projectsToIndex,
         CancellationToken cancellationToken)
     {
         var projectMap = projects.Projects.ToDictionary(project => project.Path, StringComparer.OrdinalIgnoreCase);
-        var syntaxTrees = await LoadSyntaxTreesAsync(repositoryRoot, projects, indexing, cancellationToken);
-        var compilationSet = BuildCompilations(projects, projectMap, syntaxTrees, indexing);
-        var compilations = compilationSet.Compilations;
-        var symbols = new List<SymbolRecord>();
-        var declaredSymbols = new Dictionary<ISymbol, SymbolRecord>(SymbolEqualityComparer.Default);
-
-        foreach (var project in projects.Projects)
+        var outputProjects = (projectsToIndex ?? projectMap.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase))
+            .Where(projectMap.ContainsKey)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var analysisProjects = new RepositoryIndex
         {
-            if (!compilations.TryGetValue(project.Path, out var compilation))
+            Solution = projects.Solution,
+            Projects = ExpandReferencedProjects(outputProjects, projectMap)
+                .Select(path => projectMap[path])
+                .OrderBy(project => project.Path, StringComparer.Ordinal)
+                .ToArray()
+        };
+        var outputRepository = new RepositoryIndex
+        {
+            Solution = projects.Solution,
+            Projects = projects.Projects
+                .Where(project => outputProjects.Contains(project.Path))
+                .OrderBy(project => project.Path, StringComparer.Ordinal)
+                .ToArray()
+        };
+        var analysisProjectMap = analysisProjects.Projects.ToDictionary(
+            project => project.Path,
+            StringComparer.OrdinalIgnoreCase);
+        var syntaxTrees = await LoadSyntaxTreesAsync(
+            repositoryRoot,
+            analysisProjects,
+            indexing,
+            cancellationToken);
+        var compilationSet = BuildCompilations(
+            repositoryRoot,
+            analysisProjects,
+            analysisProjectMap,
+            syntaxTrees,
+            indexing);
+        var compilations = compilationSet.Compilations;
+        var declarationIndexes = await ParallelWork.SelectAsync(
+            analysisProjects.Projects,
+            indexing.MaxParallelism,
+            async (project, token) => await IndexDeclarationsAsync(
+                repositoryRoot,
+                project,
+                compilations,
+                token),
+            cancellationToken);
+        var symbols = declarationIndexes.SelectMany(index => index.Symbols).ToList();
+        var declaredSymbols = new Dictionary<ISymbol, SymbolRecord>(SymbolEqualityComparer.Default);
+        foreach (var declarationIndex in declarationIndexes)
+        {
+            foreach (var (symbol, record) in declarationIndex.DeclaredSymbols)
             {
-                continue;
-            }
-
-            foreach (var tree in compilation.SyntaxTrees)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var root = await tree.GetRootAsync(cancellationToken);
-                var model = compilation.GetSemanticModel(tree, true);
-                var file = NormalizeRelative(repositoryRoot, tree.FilePath);
-                IndexTypes(root, model, project, file, symbols, declaredSymbols);
-                IndexMembers(root, model, project, file, symbols, declaredSymbols);
+                declaredSymbols.TryAdd(symbol, record);
             }
         }
 
         IReadOnlyList<SymbolReference> references = await IndexReferencesAsync(
             repositoryRoot,
-            projects,
+            analysisProjects,
             compilations,
             declaredSymbols,
+            indexing.MaxParallelism,
             cancellationToken);
+        references = references
+            .Where(reference => outputProjects.Contains(reference.SourceProject))
+            .ToArray();
         var markup = await MarkupIndexer.BuildAsync(
             repositoryRoot,
-            projects,
+            outputRepository,
             symbols,
             cancellationToken);
-        symbols.AddRange(markup.Symbols);
+        symbols = symbols.Where(symbol => outputProjects.Contains(symbol.Project))
+            .Concat(markup.Symbols)
+            .ToList();
         references = references.Concat(markup.References)
             .Distinct()
             .OrderBy(reference => reference.SourceProject, StringComparer.Ordinal)
@@ -87,6 +134,7 @@ internal static class SymbolIndexer
             .ThenBy(reference => reference.Relationship, StringComparer.Ordinal)
             .ToArray();
         var orderedSymbols = symbols
+            .DistinctBy(symbol => symbol.Identity, StringComparer.Ordinal)
             .OrderBy(symbol => symbol.Project, StringComparer.Ordinal)
             .ThenBy(symbol => symbol.File, StringComparer.Ordinal)
             .ThenBy(symbol => symbol.Line)
@@ -94,11 +142,12 @@ internal static class SymbolIndexer
             .ToArray();
         var typeDefinitions = await TypeDefinitionIndexer.BuildAsync(
             repositoryRoot,
-            projects,
+            outputRepository,
             compilations,
             orderedSymbols,
+            indexing.MaxParallelism,
             cancellationToken);
-        var projectDependencies = projects.Projects
+        var projectDependencies = outputRepository.Projects
             .SelectMany(project => project.ProjectReferences.Select(reference =>
                 new ProjectDependency(project.Path, reference)))
             .OrderBy(dependency => dependency.Project, StringComparer.Ordinal)
@@ -121,8 +170,12 @@ internal static class SymbolIndexer
             {
                 Symbols = orderedSymbols,
                 TypeDefinitions = typeDefinitions,
-                CompilationCompleteness = compilationSet.Completeness,
+                CompilationCompleteness = compilationSet.Completeness
+                    .Where(record => outputProjects.Contains(record.Project))
+                    .ToArray(),
                 GeneratedSources = compilationSet.GeneratedSources
+                    .Where(source => outputProjects.Contains(source.Project))
+                    .ToArray()
             },
             new DependencyIndex
             {
@@ -132,65 +185,135 @@ internal static class SymbolIndexer
             });
     }
 
+    private static IReadOnlySet<string> ExpandReferencedProjects(
+        IReadOnlySet<string> outputProjects,
+        IReadOnlyDictionary<string, ProjectRecord> projectMap)
+    {
+        var result = outputProjects.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var pending = new Queue<string>(outputProjects.Order(StringComparer.Ordinal));
+        while (pending.TryDequeue(out var projectPath))
+        {
+            if (!projectMap.TryGetValue(projectPath, out var project))
+            {
+                continue;
+            }
+
+            foreach (var reference in project.ProjectReferences.Order(StringComparer.Ordinal))
+            {
+                if (projectMap.ContainsKey(reference) && result.Add(reference))
+                {
+                    pending.Enqueue(reference);
+                }
+            }
+        }
+
+        return result;
+    }
+
+    private static async Task<DeclarationIndex> IndexDeclarationsAsync(
+        string repositoryRoot,
+        ProjectRecord project,
+        IReadOnlyDictionary<string, CSharpCompilation> compilations,
+        CancellationToken cancellationToken)
+    {
+        var symbols = new List<SymbolRecord>();
+        var declaredSymbols = new Dictionary<ISymbol, SymbolRecord>(SymbolEqualityComparer.Default);
+        if (!compilations.TryGetValue(project.Path, out var compilation))
+        {
+            return new DeclarationIndex(symbols, declaredSymbols);
+        }
+
+        foreach (var tree in compilation.SyntaxTrees)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var root = await tree.GetRootAsync(cancellationToken);
+            var model = compilation.GetSemanticModel(tree, true);
+            var file = NormalizeRelative(repositoryRoot, tree.FilePath);
+            IndexTypes(root, model, project, file, symbols, declaredSymbols);
+            IndexMembers(root, model, project, file, symbols, declaredSymbols);
+        }
+
+        return new DeclarationIndex(symbols, declaredSymbols);
+    }
+
     private static async Task<IReadOnlyDictionary<string, IReadOnlyList<SyntaxTree>>> LoadSyntaxTreesAsync(
         string repositoryRoot,
         RepositoryIndex projects,
         IndexingConfig indexing,
         CancellationToken cancellationToken)
     {
+        var projectTrees = await ParallelWork.SelectAsync(
+            projects.Projects,
+            indexing.MaxParallelism,
+            async (project, token) => await LoadProjectSyntaxTreesAsync(
+                repositoryRoot,
+                project,
+                indexing,
+                token),
+            cancellationToken);
         var result = new Dictionary<string, IReadOnlyList<SyntaxTree>>(StringComparer.OrdinalIgnoreCase);
-        foreach (var project in projects.Projects)
+        for (var index = 0; index < projects.Projects.Count; index++)
         {
-            var trees = new List<SyntaxTree>();
-            var parseOptions = CreateParseOptions(project);
-            foreach (var relativeFile in project.SourceFiles)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var fullPath = Path.GetFullPath(Path.Combine(
-                    repositoryRoot,
-                    relativeFile.Replace('/', Path.DirectorySeparatorChar)));
-                if (!File.Exists(fullPath))
-                {
-                    continue;
-                }
-
-                if (new FileInfo(fullPath).Length > indexing.MaxSourceFileBytes)
-                {
-                    continue;
-                }
-
-                var source = await File.ReadAllTextAsync(fullPath, cancellationToken);
-                trees.Add(CSharpSyntaxTree.ParseText(
-                    source,
-                    parseOptions,
-                    fullPath,
-                    cancellationToken: cancellationToken));
-            }
-
-            if (project.GlobalUsings.Count > 0)
-            {
-                var globalUsingSource = string.Join(
-                    Environment.NewLine,
-                    project.GlobalUsings.Select(RenderGlobalUsing));
-                var syntheticPath = Path.Combine(
-                    repositoryRoot,
-                    ContextPaths.DirectoryName,
-                    "synthetic",
-                    $"{project.AssemblyName ?? project.Name}{SyntheticGlobalUsingsSuffix}");
-                trees.Add(CSharpSyntaxTree.ParseText(
-                    globalUsingSource,
-                    parseOptions,
-                    syntheticPath,
-                    cancellationToken: cancellationToken));
-            }
-
-            result[project.Path] = trees;
+            result[projects.Projects[index].Path] = projectTrees[index];
         }
 
         return result;
     }
 
+    private static async Task<IReadOnlyList<SyntaxTree>> LoadProjectSyntaxTreesAsync(
+        string repositoryRoot,
+        ProjectRecord project,
+        IndexingConfig indexing,
+        CancellationToken cancellationToken)
+    {
+        var trees = new List<SyntaxTree>();
+        if (!IsCSharpProject(project))
+        {
+            return trees;
+        }
+
+        var parseOptions = CreateParseOptions(project);
+        foreach (var relativeFile in project.SourceFiles)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var fullPath = Path.GetFullPath(Path.Combine(
+                repositoryRoot,
+                relativeFile.Replace('/', Path.DirectorySeparatorChar)));
+            if (!File.Exists(fullPath) || new FileInfo(fullPath).Length > indexing.MaxSourceFileBytes)
+            {
+                continue;
+            }
+
+            var source = await File.ReadAllTextAsync(fullPath, cancellationToken);
+            trees.Add(CSharpSyntaxTree.ParseText(
+                source,
+                parseOptions,
+                fullPath,
+                cancellationToken: cancellationToken));
+        }
+
+        if (project.GlobalUsings.Count > 0)
+        {
+            var globalUsingSource = string.Join(
+                Environment.NewLine,
+                project.GlobalUsings.Select(RenderGlobalUsing));
+            var syntheticPath = Path.Combine(
+                repositoryRoot,
+                ContextPaths.DirectoryName,
+                "synthetic",
+                $"{project.AssemblyName ?? project.Name}{SyntheticGlobalUsingsSuffix}");
+            trees.Add(CSharpSyntaxTree.ParseText(
+                globalUsingSource,
+                parseOptions,
+                syntheticPath,
+                cancellationToken: cancellationToken));
+        }
+
+        return trees;
+    }
+
     private static CompilationSet BuildCompilations(
+        string repositoryRoot,
         RepositoryIndex projects,
         IReadOnlyDictionary<string, ProjectRecord> projectMap,
         IReadOnlyDictionary<string, IReadOnlyList<SyntaxTree>> syntaxTrees,
@@ -249,7 +372,8 @@ internal static class SymbolIndexer
 
             foreach (var referencePath in project.ProjectReferences)
             {
-                if (projectMap.TryGetValue(referencePath, out var referencedProject))
+                if (projectMap.TryGetValue(referencePath, out var referencedProject)
+                    && IsCSharpProject(referencedProject))
                 {
                     var referencedFramework = referencedProject.TargetFrameworks.Contains(
                         framework,
@@ -272,6 +396,11 @@ internal static class SymbolIndexer
 
         foreach (var project in projects.Projects)
         {
+            if (!IsCSharpProject(project))
+            {
+                continue;
+            }
+
             var frameworks = FrameworksOf(project);
             foreach (var framework in frameworks)
             {
@@ -281,10 +410,12 @@ internal static class SymbolIndexer
         }
 
         var completeness = projects.Projects
-            .SelectMany(project => FrameworksOf(project).Select(framework =>
+            .SelectMany(project => IsCSharpProject(project)
+                ? FrameworksOf(project).Select(framework =>
             {
                 var key = CompilationKey(project.Path, framework);
                 return BuildCompleteness(
+                    repositoryRoot,
                     project,
                     framework,
                     TargetAnalysis(project, framework),
@@ -293,7 +424,8 @@ internal static class SymbolIndexer
                         !tree.FilePath.EndsWith(SyntheticGlobalUsingsSuffix, StringComparison.Ordinal)),
                     referenceCounts.GetValueOrDefault(key),
                     generatorExecutions[key]);
-            }))
+            })
+                : BuildNonCSharpCompleteness(project))
             .OrderBy(record => record.Project, StringComparer.Ordinal)
             .ThenBy(record => record.TargetFramework, StringComparer.Ordinal)
             .ToArray();
@@ -308,7 +440,43 @@ internal static class SymbolIndexer
                 .ToArray());
     }
 
+    private static IReadOnlyList<CompilationCompletenessRecord> BuildNonCSharpCompleteness(
+        ProjectRecord project)
+    {
+        var language = Path.GetExtension(project.Path).Equals(".fsproj", StringComparison.OrdinalIgnoreCase)
+            ? "F#"
+            : "Visual Basic";
+        return FrameworksOf(project).Select(framework => new CompilationCompletenessRecord
+        {
+            Project = project.Path,
+            TargetFrameworks = project.TargetFrameworks,
+            TargetFramework = framework.Length == 0 ? null : framework,
+            State = AnalysisCompletenessState.Partial,
+            ReferenceResolutionState = project.ReferenceResolutionState,
+            ExpectedSourceFiles = project.SourceFiles.Count,
+            LoadedSourceFiles = 0,
+            ResolvedMetadataReferences = project.MetadataReferences.Count,
+            FailedMetadataReferences = 0,
+            AnalyzerReferences = project.AnalyzerReferences.Count,
+            GeneratedSourcesIncluded = false,
+            SourceGeneratorsExecuted = false,
+            SourceGeneratorsDiscovered = 0,
+            GeneratedSourceFiles = 0,
+            CompilationErrors = 0,
+            DiagnosticIds = [],
+            Gaps =
+            [
+                $"{language} project ownership, references, and test propagation are indexed; " +
+                "Roslyn C# semantic declarations and relationships do not apply to this project."
+            ]
+        }).ToArray();
+    }
+
+    private static bool IsCSharpProject(ProjectRecord project) =>
+        Path.GetExtension(project.Path).Equals(".csproj", StringComparison.OrdinalIgnoreCase);
+
     private static CompilationCompletenessRecord BuildCompleteness(
+        string repositoryRoot,
         ProjectRecord project,
         string framework,
         TargetFrameworkAnalysisRecord analysis,
@@ -354,7 +522,14 @@ internal static class SymbolIndexer
 
         if (diagnostics.Length > 0)
         {
-            gaps.Add($"The semantic compilation contains {diagnostics.Length} error diagnostic(s).");
+            var topDiagnostics = BuildDiagnosticSummaries(repositoryRoot, diagnostics)
+                .Take(5)
+                .Select(summary =>
+                    $"{summary.Id} x{summary.Count}" +
+                    (summary.Files.Count == 0 ? string.Empty : $" in {string.Join(", ", summary.Files.Take(3))}"));
+            gaps.Add(
+                $"The semantic compilation contains {diagnostics.Length} error diagnostic(s): " +
+                string.Join("; ", topDiagnostics) + ".");
         }
 
         var state = loadedSourceFiles == 0 && project.SourceFiles.Count > 0
@@ -383,8 +558,43 @@ internal static class SymbolIndexer
                 .Distinct(StringComparer.Ordinal)
                 .Order(StringComparer.Ordinal)
                 .ToArray(),
+            DiagnosticSummaries = BuildDiagnosticSummaries(repositoryRoot, diagnostics),
             Gaps = gaps
         };
+    }
+
+    private static IReadOnlyList<CompilationDiagnosticSummary> BuildDiagnosticSummaries(
+        string repositoryRoot,
+        IEnumerable<Diagnostic> diagnostics) => diagnostics
+        .GroupBy(diagnostic => diagnostic.Id, StringComparer.Ordinal)
+        .Select(group => new CompilationDiagnosticSummary(
+            group.Key,
+            group.Count(),
+            group.Select(diagnostic => DiagnosticFile(repositoryRoot, diagnostic))
+                .Where(path => path is not null)
+                .Select(path => path!)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Order(StringComparer.Ordinal)
+                .Take(10)
+                .ToArray()))
+        .OrderByDescending(summary => summary.Count)
+        .ThenBy(summary => summary.Id, StringComparer.Ordinal)
+        .ToArray();
+
+    private static string? DiagnosticFile(string repositoryRoot, Diagnostic diagnostic)
+    {
+        if (!diagnostic.Location.IsInSource)
+        {
+            return null;
+        }
+
+        var path = diagnostic.Location.GetLineSpan().Path;
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return null;
+        }
+
+        return Path.IsPathRooted(path) ? NormalizeRelative(repositoryRoot, path) : path.Replace('\\', '/');
     }
 
     private static IReadOnlyList<string> FrameworksOf(ProjectRecord project) =>
@@ -429,9 +639,13 @@ internal static class SymbolIndexer
         var gaps = new List<string>();
         foreach (var path in analysis.AnalyzerReferences)
         {
+            loader.AddDependencyLocation(path);
+        }
+
+        foreach (var path in analysis.AnalyzerReferences)
+        {
             try
             {
-                loader.AddDependencyLocation(path);
                 var reference = new AnalyzerFileReference(path, loader);
                 generators.AddRange(reference.GetGenerators(LanguageNames.CSharp));
             }
@@ -456,16 +670,18 @@ internal static class SymbolIndexer
             var parseOptions = compilation.SyntaxTrees.FirstOrDefault()?.Options as CSharpParseOptions
                                ?? CSharpParseOptions.Default;
             GeneratorDriver driver = CSharpGeneratorDriver.Create(
-                generators.DistinctBy(generator => generator.GetType().AssemblyQualifiedName).ToArray(),
+                generators.ToArray(),
                 parseOptions: parseOptions);
             driver = driver.RunGeneratorsAndUpdateCompilation(
                 compilation,
                 out var outputCompilation,
                 out var generatorDiagnostics);
             foreach (var diagnostic in generatorDiagnostics.Where(diagnostic =>
-                         diagnostic.Severity == DiagnosticSeverity.Error))
+                         diagnostic.Severity is DiagnosticSeverity.Warning or DiagnosticSeverity.Error))
             {
-                gaps.Add($"Source generator {diagnostic.Id}: {diagnostic.GetMessage()}");
+                gaps.Add(
+                    $"Source generator {diagnostic.Severity.ToString().ToLowerInvariant()} {diagnostic.Id}: " +
+                    CompactDiagnosticMessage(diagnostic.GetMessage()));
             }
 
             var generatedTrees = outputCompilation.SyntaxTrees
@@ -519,10 +735,24 @@ internal static class SymbolIndexer
     private static string DisplayFramework(string framework) =>
         framework.Length == 0 ? "default" : framework.Replace('/', '_').Replace('\\', '_');
 
+    private static string CompactDiagnosticMessage(string message)
+    {
+        var compact = string.Join(
+            ' ',
+            message.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        return compact.Length <= 500 ? compact : compact[..497] + "...";
+    }
+
     private sealed class GeneratorAssemblyLoader : IAnalyzerAssemblyLoader
     {
         private readonly Dictionary<string, string> _dependencyPaths =
             new(StringComparer.OrdinalIgnoreCase);
+        private readonly GeneratorLoadContext _loadContext;
+
+        public GeneratorAssemblyLoader()
+        {
+            _loadContext = new GeneratorLoadContext(_dependencyPaths);
+        }
 
         public void AddDependencyLocation(string fullPath)
         {
@@ -536,7 +766,25 @@ internal static class SymbolIndexer
             var assemblyName = AssemblyName.GetAssemblyName(resolvedPath);
             var loaded = AssemblyLoadContext.Default.Assemblies.FirstOrDefault(assembly =>
                 AssemblyName.ReferenceMatchesDefinition(assembly.GetName(), assemblyName));
-            return loaded ?? AssemblyLoadContext.Default.LoadFromAssemblyPath(resolvedPath);
+            return loaded ?? _loadContext.LoadFromAssemblyPath(resolvedPath);
+        }
+
+        private sealed class GeneratorLoadContext(
+            IReadOnlyDictionary<string, string> dependencyPaths) : AssemblyLoadContext
+        {
+            protected override Assembly? Load(AssemblyName assemblyName)
+            {
+                var shared = Default.Assemblies.FirstOrDefault(assembly =>
+                    AssemblyName.ReferenceMatchesDefinition(assembly.GetName(), assemblyName));
+                if (shared is not null)
+                {
+                    return shared;
+                }
+
+                return dependencyPaths.TryGetValue(assemblyName.Name ?? string.Empty, out var path)
+                    ? LoadFromAssemblyPath(path)
+                    : null;
+            }
         }
     }
 
@@ -545,11 +793,22 @@ internal static class SymbolIndexer
         IEnumerable<SyntaxTree> trees,
         IEnumerable<MetadataReference> references)
     {
+        var syntaxTrees = trees.ToArray();
         var nullable = project.Nullable?.Contains("enable", StringComparison.OrdinalIgnoreCase) == true
             ? NullableContextOptions.Enable
             : NullableContextOptions.Disable;
+        var hasTopLevelStatements = syntaxTrees.Any(tree =>
+            tree.GetRoot() is CompilationUnitSyntax root
+            && root.Members.Any(member => member is GlobalStatementSyntax));
+        var outputKind = (project.CompilerSettings.OutputType?.ToLowerInvariant(), hasTopLevelStatements) switch
+        {
+            ("exe", true) => OutputKind.ConsoleApplication,
+            ("winexe", true) => OutputKind.WindowsApplication,
+            ("module", _) => OutputKind.NetModule,
+            _ => OutputKind.DynamicallyLinkedLibrary
+        };
         var options = new CSharpCompilationOptions(
-            OutputKind.DynamicallyLinkedLibrary,
+            outputKind,
             optimizationLevel: project.CompilerSettings.Optimize
                 ? OptimizationLevel.Release
                 : OptimizationLevel.Debug,
@@ -557,7 +816,7 @@ internal static class SymbolIndexer
             nullableContextOptions: nullable);
         return CSharpCompilation.Create(
             project.AssemblyName ?? project.Name,
-            trees,
+            syntaxTrees,
             references,
             options);
     }
@@ -751,238 +1010,19 @@ internal static class SymbolIndexer
         RepositoryIndex projects,
         IReadOnlyDictionary<string, CSharpCompilation> compilations,
         IReadOnlyDictionary<ISymbol, SymbolRecord> declaredSymbols,
+        int maxParallelism,
         CancellationToken cancellationToken)
     {
-        var references = new HashSet<SymbolReference>();
-        foreach (var project in projects.Projects)
-        {
-            if (!compilations.TryGetValue(project.Path, out var compilation))
-            {
-                continue;
-            }
-
-            var targetFramework = FrameworksOf(project).FirstOrDefault();
-
-            foreach (var tree in compilation.SyntaxTrees)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var root = await tree.GetRootAsync(cancellationToken);
-                var model = compilation.GetSemanticModel(tree, true);
-                foreach (var invocation in root.DescendantNodes().OfType<InvocationExpressionSyntax>())
-                {
-                    var source = FindContainingSymbol(invocation, model, declaredSymbols);
-                    var operation = model.GetOperation(invocation, cancellationToken) as IInvocationOperation;
-                    var target = operation?.TargetMethod
-                                 ?? model.GetSymbolInfo(invocation, cancellationToken).Symbol;
-                    AddReference(
-                        source,
-                        target,
-                        "method-call",
-                        declaredSymbols,
-                        references,
-                        evidence: invocation,
-                        origin: operation is null ? "roslyn-semantic" : "roslyn-operation",
-                        targetFramework: targetFramework);
-                    AddDependencyInjectionReferences(
-                        invocation,
-                        operation,
-                        source,
-                        model,
-                        declaredSymbols,
-                        references,
-                        cancellationToken,
-                        targetFramework);
-                }
-
-                foreach (var creation in root.DescendantNodes().OfType<ObjectCreationExpressionSyntax>())
-                {
-                    var source = FindContainingSymbol(creation, model, declaredSymbols);
-                    var operation = model.GetOperation(creation, cancellationToken) as IObjectCreationOperation;
-                    AddReference(
-                        source,
-                        operation?.Constructor ?? model.GetSymbolInfo(creation, cancellationToken).Symbol,
-                        "constructs",
-                        declaredSymbols,
-                        references,
-                        evidence: creation,
-                        origin: operation is null ? "roslyn-semantic" : "roslyn-operation",
-                        targetFramework: targetFramework);
-                    AddTypeReferences(
-                        source,
-                        operation?.Type ?? model.GetTypeInfo(creation, cancellationToken).Type,
-                        "constructed-type",
-                        declaredSymbols,
-                        references,
-                        evidence: creation,
-                        origin: operation is null ? "roslyn-semantic" : "roslyn-operation",
-                        targetFramework: targetFramework);
-                }
-
-                foreach (var name in root.DescendantNodes().OfType<SimpleNameSyntax>())
-                {
-                    if (IsInvocationTarget(name) || IsDeclarationName(name))
-                    {
-                        continue;
-                    }
-
-                    var operation = model.GetOperation(name, cancellationToken);
-                    var target = ReferencedMember(operation)
-                                 ?? model.GetSymbolInfo(name, cancellationToken).Symbol;
-                    if (target is not (IPropertySymbol or IFieldSymbol or IEventSymbol))
-                    {
-                        continue;
-                    }
-
-                    var relationships = MemberAccessRelationships(operation, name, target);
-                    foreach (var relationship in relationships)
-                    {
-                        AddReference(
-                            FindContainingSymbol(name, model, declaredSymbols),
-                            target,
-                            relationship,
-                            declaredSymbols,
-                            references,
-                            evidence: name,
-                            origin: operation is null ? "roslyn-semantic" : "roslyn-operation",
-                            targetFramework: targetFramework);
-                    }
-                }
-
-                foreach (var argument in root.DescendantNodes().OfType<ArgumentSyntax>())
-                {
-                    var operation = model.GetOperation(argument, cancellationToken) as IArgumentOperation;
-                    var target = FindMethodReference(operation?.Value)
-                                 ?? model.GetSymbolInfo(argument.Expression, cancellationToken).Symbol;
-                    if (target is IMethodSymbol)
-                    {
-                        AddReference(
-                            FindContainingSymbol(argument, model, declaredSymbols),
-                            target,
-                            "delegate-callback",
-                            declaredSymbols,
-                            references,
-                            evidence: argument.Expression,
-                            origin: operation is null ? "roslyn-semantic" : "roslyn-operation",
-                            targetFramework: targetFramework);
-                    }
-                }
-
-                foreach (var genericName in root.DescendantNodes().OfType<GenericNameSyntax>())
-                {
-                    var source = FindContainingSymbol(genericName, model, declaredSymbols);
-                    foreach (var typeArgument in genericName.TypeArgumentList.Arguments)
-                    {
-                        AddTypeReferences(
-                            source,
-                            model.GetTypeInfo(typeArgument, cancellationToken).Type,
-                            "generic-type-argument",
-                            declaredSymbols,
-                            references);
-                    }
-                }
-
-                foreach (var field in root.DescendantNodes().OfType<FieldDeclarationSyntax>())
-                {
-                    AddTypeReferences(
-                        FindContainingSymbol(field, model, declaredSymbols),
-                        model.GetTypeInfo(field.Declaration.Type, cancellationToken).Type,
-                        "field-type",
-                        declaredSymbols,
-                        references);
-                }
-
-                foreach (var property in root.DescendantNodes().OfType<PropertyDeclarationSyntax>())
-                {
-                    var propertyType = model.GetTypeInfo(property.Type, cancellationToken).Type;
-                    AddTypeReferences(
-                        FindContainingSymbol(property, model, declaredSymbols),
-                        propertyType,
-                        "property-type",
-                        declaredSymbols,
-                        references);
-                    AddTypeReferences(
-                        FindContainingTypeSymbol(property, model, declaredSymbols),
-                        propertyType,
-                        "property-type",
-                        declaredSymbols,
-                        references);
-                }
-
-                foreach (var eventDeclaration in root.DescendantNodes().OfType<EventDeclarationSyntax>())
-                {
-                    var eventType = model.GetTypeInfo(eventDeclaration.Type, cancellationToken).Type;
-                    AddTypeReferences(
-                        FindContainingSymbol(eventDeclaration, model, declaredSymbols),
-                        eventType,
-                        "event-type",
-                        declaredSymbols,
-                        references);
-                    AddTypeReferences(
-                        FindContainingTypeSymbol(eventDeclaration, model, declaredSymbols),
-                        eventType,
-                        "event-type",
-                        declaredSymbols,
-                        references);
-                }
-
-                foreach (var eventField in root.DescendantNodes().OfType<EventFieldDeclarationSyntax>())
-                {
-                    AddTypeReferences(
-                        FindContainingSymbol(eventField, model, declaredSymbols),
-                        model.GetTypeInfo(eventField.Declaration.Type, cancellationToken).Type,
-                        "event-type",
-                        declaredSymbols,
-                        references);
-                }
-
-                foreach (var method in root.DescendantNodes().OfType<MethodDeclarationSyntax>())
-                {
-                    var source = FindContainingSymbol(method.ReturnType, model, declaredSymbols);
-                    AddTypeReferences(
-                        source,
-                        model.GetTypeInfo(method.ReturnType, cancellationToken).Type,
-                        "return-type",
-                        declaredSymbols,
-                        references);
-                    foreach (var parameter in method.ParameterList.Parameters)
-                    {
-                        AddTypeReferences(
-                            source,
-                            parameter.Type is null
-                                ? null
-                                : model.GetTypeInfo(parameter.Type, cancellationToken).Type,
-                            "parameter-type",
-                            declaredSymbols,
-                            references);
-                    }
-                }
-
-                foreach (var constructor in root.DescendantNodes().OfType<ConstructorDeclarationSyntax>())
-                {
-                    var source = FindContainingSymbol(constructor, model, declaredSymbols);
-                    var containingTypeSource = FindContainingTypeSymbol(constructor, model, declaredSymbols);
-                    foreach (var parameter in constructor.ParameterList.Parameters)
-                    {
-                        var parameterType = parameter.Type is null
-                            ? null
-                            : model.GetTypeInfo(parameter.Type, cancellationToken).Type;
-                        AddTypeReferences(
-                            source,
-                            parameterType,
-                            "constructor-parameter",
-                            declaredSymbols,
-                            references);
-                        AddTypeReferences(
-                            containingTypeSource,
-                            parameterType,
-                            "constructor-parameter",
-                            declaredSymbols,
-                            references);
-                    }
-                }
-            }
-        }
-
+        var projectReferences = await ParallelWork.SelectAsync(
+            projects.Projects,
+            maxParallelism,
+            async (project, token) => await IndexProjectReferencesAsync(
+                project,
+                compilations,
+                declaredSymbols,
+                token),
+            cancellationToken);
+        var references = projectReferences.SelectMany(project => project).ToHashSet();
         AddOverrideAndInterfaceReferences(declaredSymbols, references);
 
         return references
@@ -991,6 +1031,242 @@ internal static class SymbolIndexer
             .ThenBy(reference => reference.TargetSymbol, StringComparer.Ordinal)
             .ThenBy(reference => reference.Relationship, StringComparer.Ordinal)
             .ToArray();
+    }
+
+    private static async Task<IReadOnlyList<SymbolReference>> IndexProjectReferencesAsync(
+        ProjectRecord project,
+        IReadOnlyDictionary<string, CSharpCompilation> compilations,
+        IReadOnlyDictionary<ISymbol, SymbolRecord> declaredSymbols,
+        CancellationToken cancellationToken)
+    {
+        var references = new HashSet<SymbolReference>();
+        if (!compilations.TryGetValue(project.Path, out var compilation))
+        {
+            return [];
+        }
+
+        var targetFramework = FrameworksOf(project).FirstOrDefault();
+
+        foreach (var tree in compilation.SyntaxTrees)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var root = await tree.GetRootAsync(cancellationToken);
+            var model = compilation.GetSemanticModel(tree, true);
+            foreach (var invocation in root.DescendantNodes().OfType<InvocationExpressionSyntax>())
+            {
+                var source = FindContainingSymbol(invocation, model, declaredSymbols);
+                var operation = model.GetOperation(invocation, cancellationToken) as IInvocationOperation;
+                var target = operation?.TargetMethod
+                             ?? model.GetSymbolInfo(invocation, cancellationToken).Symbol;
+                AddReference(
+                    source,
+                    target,
+                    "method-call",
+                    declaredSymbols,
+                    references,
+                    evidence: invocation,
+                    origin: operation is null ? "roslyn-semantic" : "roslyn-operation",
+                    targetFramework: targetFramework);
+                AddDependencyInjectionReferences(
+                    invocation,
+                    operation,
+                    source,
+                    model,
+                    declaredSymbols,
+                    references,
+                    cancellationToken,
+                    targetFramework);
+            }
+
+            foreach (var creation in root.DescendantNodes().OfType<ObjectCreationExpressionSyntax>())
+            {
+                var source = FindContainingSymbol(creation, model, declaredSymbols);
+                var operation = model.GetOperation(creation, cancellationToken) as IObjectCreationOperation;
+                AddReference(
+                    source,
+                    operation?.Constructor ?? model.GetSymbolInfo(creation, cancellationToken).Symbol,
+                    "constructs",
+                    declaredSymbols,
+                    references,
+                    evidence: creation,
+                    origin: operation is null ? "roslyn-semantic" : "roslyn-operation",
+                    targetFramework: targetFramework);
+                AddTypeReferences(
+                    source,
+                    operation?.Type ?? model.GetTypeInfo(creation, cancellationToken).Type,
+                    "constructed-type",
+                    declaredSymbols,
+                    references,
+                    evidence: creation,
+                    origin: operation is null ? "roslyn-semantic" : "roslyn-operation",
+                    targetFramework: targetFramework);
+            }
+
+            foreach (var name in root.DescendantNodes().OfType<SimpleNameSyntax>())
+            {
+                if (IsInvocationTarget(name) || IsDeclarationName(name))
+                {
+                    continue;
+                }
+
+                var operation = model.GetOperation(name, cancellationToken);
+                var target = ReferencedMember(operation)
+                             ?? model.GetSymbolInfo(name, cancellationToken).Symbol;
+                if (target is not (IPropertySymbol or IFieldSymbol or IEventSymbol))
+                {
+                    continue;
+                }
+
+                var relationships = MemberAccessRelationships(operation, name, target);
+                foreach (var relationship in relationships)
+                {
+                    AddReference(
+                        FindContainingSymbol(name, model, declaredSymbols),
+                        target,
+                        relationship,
+                        declaredSymbols,
+                        references,
+                        evidence: name,
+                        origin: operation is null ? "roslyn-semantic" : "roslyn-operation",
+                        targetFramework: targetFramework);
+                }
+            }
+
+            foreach (var argument in root.DescendantNodes().OfType<ArgumentSyntax>())
+            {
+                var operation = model.GetOperation(argument, cancellationToken) as IArgumentOperation;
+                var target = FindMethodReference(operation?.Value)
+                             ?? model.GetSymbolInfo(argument.Expression, cancellationToken).Symbol;
+                if (target is IMethodSymbol)
+                {
+                    AddReference(
+                        FindContainingSymbol(argument, model, declaredSymbols),
+                        target,
+                        "delegate-callback",
+                        declaredSymbols,
+                        references,
+                        evidence: argument.Expression,
+                        origin: operation is null ? "roslyn-semantic" : "roslyn-operation",
+                        targetFramework: targetFramework);
+                }
+            }
+
+            foreach (var genericName in root.DescendantNodes().OfType<GenericNameSyntax>())
+            {
+                var source = FindContainingSymbol(genericName, model, declaredSymbols);
+                foreach (var typeArgument in genericName.TypeArgumentList.Arguments)
+                {
+                    AddTypeReferences(
+                        source,
+                        model.GetTypeInfo(typeArgument, cancellationToken).Type,
+                        "generic-type-argument",
+                        declaredSymbols,
+                        references);
+                }
+            }
+
+            foreach (var field in root.DescendantNodes().OfType<FieldDeclarationSyntax>())
+            {
+                AddTypeReferences(
+                    FindContainingSymbol(field, model, declaredSymbols),
+                    model.GetTypeInfo(field.Declaration.Type, cancellationToken).Type,
+                    "field-type",
+                    declaredSymbols,
+                    references);
+            }
+
+            foreach (var property in root.DescendantNodes().OfType<PropertyDeclarationSyntax>())
+            {
+                var propertyType = model.GetTypeInfo(property.Type, cancellationToken).Type;
+                AddTypeReferences(
+                    FindContainingSymbol(property, model, declaredSymbols),
+                    propertyType,
+                    "property-type",
+                    declaredSymbols,
+                    references);
+                AddTypeReferences(
+                    FindContainingTypeSymbol(property, model, declaredSymbols),
+                    propertyType,
+                    "property-type",
+                    declaredSymbols,
+                    references);
+            }
+
+            foreach (var eventDeclaration in root.DescendantNodes().OfType<EventDeclarationSyntax>())
+            {
+                var eventType = model.GetTypeInfo(eventDeclaration.Type, cancellationToken).Type;
+                AddTypeReferences(
+                    FindContainingSymbol(eventDeclaration, model, declaredSymbols),
+                    eventType,
+                    "event-type",
+                    declaredSymbols,
+                    references);
+                AddTypeReferences(
+                    FindContainingTypeSymbol(eventDeclaration, model, declaredSymbols),
+                    eventType,
+                    "event-type",
+                    declaredSymbols,
+                    references);
+            }
+
+            foreach (var eventField in root.DescendantNodes().OfType<EventFieldDeclarationSyntax>())
+            {
+                AddTypeReferences(
+                    FindContainingSymbol(eventField, model, declaredSymbols),
+                    model.GetTypeInfo(eventField.Declaration.Type, cancellationToken).Type,
+                    "event-type",
+                    declaredSymbols,
+                    references);
+            }
+
+            foreach (var method in root.DescendantNodes().OfType<MethodDeclarationSyntax>())
+            {
+                var source = FindContainingSymbol(method.ReturnType, model, declaredSymbols);
+                AddTypeReferences(
+                    source,
+                    model.GetTypeInfo(method.ReturnType, cancellationToken).Type,
+                    "return-type",
+                    declaredSymbols,
+                    references);
+                foreach (var parameter in method.ParameterList.Parameters)
+                {
+                    AddTypeReferences(
+                        source,
+                        parameter.Type is null
+                            ? null
+                            : model.GetTypeInfo(parameter.Type, cancellationToken).Type,
+                        "parameter-type",
+                        declaredSymbols,
+                        references);
+                }
+            }
+
+            foreach (var constructor in root.DescendantNodes().OfType<ConstructorDeclarationSyntax>())
+            {
+                var source = FindContainingSymbol(constructor, model, declaredSymbols);
+                var containingTypeSource = FindContainingTypeSymbol(constructor, model, declaredSymbols);
+                foreach (var parameter in constructor.ParameterList.Parameters)
+                {
+                    var parameterType = parameter.Type is null
+                        ? null
+                        : model.GetTypeInfo(parameter.Type, cancellationToken).Type;
+                    AddTypeReferences(
+                        source,
+                        parameterType,
+                        "constructor-parameter",
+                        declaredSymbols,
+                        references);
+                    AddTypeReferences(
+                        containingTypeSource,
+                        parameterType,
+                        "constructor-parameter",
+                        declaredSymbols,
+                        references);
+                }
+            }
+        }
+
+        return references.ToArray();
     }
 
     private static SymbolRecord? FindContainingSymbol(
@@ -1350,25 +1626,14 @@ internal static class SymbolIndexer
 
     private static IMethodSymbol? FindMethodReference(IOperation? operation)
     {
-        if (operation is null)
+        return operation switch
         {
-            return null;
-        }
-
-        if (operation is IMethodReferenceOperation methodReference)
-        {
-            return methodReference.Method;
-        }
-
-        foreach (var child in operation.ChildOperations)
-        {
-            if (FindMethodReference(child) is { } method)
-            {
-                return method;
-            }
-        }
-
-        return null;
+            IMethodReferenceOperation methodReference => methodReference.Method,
+            IDelegateCreationOperation delegateCreation => FindMethodReference(delegateCreation.Target),
+            IConversionOperation { Type.TypeKind: Microsoft.CodeAnalysis.TypeKind.Delegate } conversion =>
+                FindMethodReference(conversion.Operand),
+            _ => null
+        };
     }
 
     private static bool IsInvocationTarget(SimpleNameSyntax name) =>

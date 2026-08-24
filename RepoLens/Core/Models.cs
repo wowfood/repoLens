@@ -1,10 +1,11 @@
 using System.Text.Json.Serialization;
+using DevContext.Configuration;
 
 namespace DevContext.Core;
 
 public static class SchemaVersions
 {
-    public const int Current = 8;
+    public const int Current = 10;
     public const int MinimumReadable = 5;
 
     public static bool IsReadable(int version) => version is >= MinimumReadable and <= Current;
@@ -17,6 +18,16 @@ public static class SchemaVersions
                 $"{artifact} uses schema {version}; this version reads schemas {MinimumReadable}-{Current}.");
         }
     }
+}
+
+public sealed record InitializationReport
+{
+    public int SchemaVersion { get; init; } = SchemaVersions.Current;
+    public required string RepositoryRoot { get; init; }
+    public required string ConfigPath { get; init; }
+    public required bool Created { get; init; }
+    public bool Migrated { get; init; }
+    public required DevContextConfig Configuration { get; init; }
 }
 
 [JsonConverter(typeof(JsonStringEnumConverter))]
@@ -58,6 +69,7 @@ public sealed record DoctorReport
     public required string? SdkVersion { get; init; }
     public required bool BaselineExists { get; init; }
     public required IReadOnlyList<DoctorProjectSummary> Projects { get; init; }
+    public IReadOnlyList<CompilationCompletenessRecord> CompilationCompleteness { get; init; } = [];
     public required IReadOnlyList<DoctorCheck> Checks { get; init; }
     public bool IsHealthy => Checks.All(check => check.State != DoctorCheckState.Failed);
 }
@@ -270,6 +282,8 @@ public sealed record RepositoryContextReport
     public required IReadOnlyList<string> AnalyzedProjects { get; init; }
     public required IReadOnlyList<string> AnalyzedFiles { get; init; }
     public required IReadOnlyList<string> ChangedFiles { get; init; }
+    public IReadOnlyList<GitFileChange> Changes { get; init; } = [];
+    public GitComparisonState GitComparison { get; init; } = GitComparisonState.Comparable;
     public required IReadOnlyList<DiagnosticRecord> Diagnostics { get; init; }
     public required IReadOnlyList<TestOutcomeRecord> FailingTests { get; init; }
     public required IReadOnlyList<ProjectDependency> ProjectDependencies { get; init; }
@@ -287,6 +301,33 @@ public sealed record RepositoryReportArtifact(
     string Path,
     int Characters,
     int ApproximateTokens);
+
+public sealed record RepositoryTrendPoint
+{
+    public int SchemaVersion { get; init; } = SchemaVersions.Current;
+    public required DateTimeOffset GeneratedAtUtc { get; init; }
+    public required string ReportPath { get; init; }
+    public required ContextPurpose Purpose { get; init; }
+    public required ContextScope Scope { get; init; }
+    public string? Target { get; init; }
+    public required int DiagnosticCount { get; init; }
+    public required int FailingTestCount { get; init; }
+    public required int HotspotCount { get; init; }
+    public required long HotspotChurn { get; init; }
+    public required int HotspotsWithCoverage { get; init; }
+    public required double? AverageLineCoveragePercent { get; init; }
+    public int? DiagnosticDelta { get; init; }
+    public int? FailingTestDelta { get; init; }
+    public long? HotspotChurnDelta { get; init; }
+    public double? AverageLineCoverageDelta { get; init; }
+}
+
+public sealed record RepositoryTrendReport
+{
+    public int SchemaVersion { get; init; } = SchemaVersions.Current;
+    public required DateTimeOffset GeneratedAtUtc { get; init; }
+    public required IReadOnlyList<RepositoryTrendPoint> Points { get; init; }
+}
 
 public sealed record EvidenceBlock
 {
@@ -334,9 +375,68 @@ public sealed record EvidenceBundle
     public required bool ShouldAbstain { get; init; }
     public required IReadOnlyList<string> SufficiencyReasons { get; init; }
     public IReadOnlyList<string> ChangedFiles { get; init; } = [];
+    public IReadOnlyList<GitFileChange> Changes { get; init; } = [];
+    public GitComparisonState GitComparison { get; init; } = GitComparisonState.Comparable;
     public required bool Truncated { get; init; }
     public required int ApproximateTokens { get; init; }
     public required string Prompt { get; init; }
+}
+
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum SymbolReferenceRelation
+{
+    Callers,
+    Callees,
+    Implementers,
+    Implementations,
+    Overrides,
+    Subtypes,
+    ConstructorsOf,
+    Readers,
+    Writers,
+    TestsCovering,
+    InjectedInto
+}
+
+public sealed record SymbolReferenceQueryOptions
+{
+    public required string Target { get; init; }
+    public SymbolReferenceRelation Relation { get; init; } = SymbolReferenceRelation.Callers;
+    public int MaxResults { get; init; } = 50;
+    public int MaxTokens { get; init; } = 3000;
+}
+
+public sealed record SymbolReferenceMatch
+{
+    public required SymbolRecord Source { get; init; }
+    public required SymbolRecord Target { get; init; }
+    public required string Relationship { get; init; }
+    public required EvidenceConfidence Confidence { get; init; }
+    public required string Origin { get; init; }
+    public string? TargetFramework { get; init; }
+    public string? EvidenceFile { get; init; }
+    public int? EvidenceLine { get; init; }
+    public int? EvidenceColumn { get; init; }
+    public int? EvidenceEndLine { get; init; }
+    public int? EvidenceEndColumn { get; init; }
+}
+
+public sealed record SymbolReferenceQueryReport
+{
+    public int SchemaVersion { get; init; } = SchemaVersions.Current;
+    public required string ReportId { get; init; }
+    public required string Query { get; init; }
+    public required SymbolReferenceRelation Relation { get; init; }
+    public SymbolRecord? ResolvedSymbol { get; init; }
+    public required IReadOnlyList<SymbolRecord> AmbiguousSymbols { get; init; }
+    public required IReadOnlyList<SymbolReferenceMatch> Matches { get; init; }
+    public required IReadOnlyList<CompilationCompletenessRecord> CompilationCompleteness { get; init; }
+    public required IReadOnlyList<string> AnalysisGaps { get; init; }
+    public required EvidenceSufficiency Sufficiency { get; init; }
+    public required bool ShouldAbstain { get; init; }
+    public required bool Truncated { get; init; }
+    public required int ApproximateTokens { get; init; }
+    public required string Markdown { get; init; }
 }
 
 public sealed record BaselineManifest
@@ -347,6 +447,8 @@ public sealed record BaselineManifest
     public required string RepositoryRoot { get; init; }
     public required string? Branch { get; init; }
     public required string? HeadCommit { get; init; }
+    public string? CapturedHeadCommit { get; init; }
+    public string? DiffBaseReference { get; init; }
     public required bool WorkingTreeDirty { get; init; }
     public required string SdkVersion { get; init; }
     public required IReadOnlyList<StageTiming> Timings { get; init; }
@@ -363,6 +465,26 @@ public sealed record GitSnapshot
     public required string? HeadCommit { get; init; }
     public required IReadOnlyList<GitFileState> Files { get; init; }
 }
+
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum GitChangeProvenance
+{
+    Committed,
+    WorkingTree,
+    Both
+}
+
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum GitComparisonState
+{
+    Comparable,
+    BaselineDiverged,
+    BaselineCommitUnavailable
+}
+
+public sealed record GitFileChange(
+    string Path,
+    GitChangeProvenance Provenance);
 
 public sealed record GitFileState(
     string Path,
@@ -407,6 +529,9 @@ public sealed record TestSnapshot
     public bool IsComplete { get; init; } = true;
     public bool RanFullSuiteAfterTargetedTests { get; init; }
     public IReadOnlyList<string> ProjectsExecuted { get; init; } = [];
+    public bool CoverageRequested { get; init; }
+    public IReadOnlyList<string> CoverageFiles { get; init; } = [];
+    public string? CoverageDetail { get; init; }
 }
 
 public sealed record TestOutcomeRecord(
@@ -601,8 +726,14 @@ public sealed record CompilationCompletenessRecord
     public int GeneratedSourceFiles { get; init; }
     public required int CompilationErrors { get; init; }
     public required IReadOnlyList<string> DiagnosticIds { get; init; }
+    public IReadOnlyList<CompilationDiagnosticSummary> DiagnosticSummaries { get; init; } = [];
     public required IReadOnlyList<string> Gaps { get; init; }
 }
+
+public sealed record CompilationDiagnosticSummary(
+    string Id,
+    int Count,
+    IReadOnlyList<string> Files);
 
 public sealed record DependencyIndex
 {
@@ -637,6 +768,8 @@ public sealed record VerificationReport
     public required string BaselineId { get; init; }
     public required DateTimeOffset VerifiedAtUtc { get; init; }
     public required IReadOnlyList<string> ChangedFiles { get; init; }
+    public IReadOnlyList<GitFileChange> Changes { get; init; } = [];
+    public GitComparisonState GitComparison { get; init; } = GitComparisonState.Comparable;
     public IReadOnlyList<SymbolRecord> ChangedSymbols { get; init; } = [];
     public required IReadOnlyList<DiagnosticRecord> NewDiagnostics { get; init; }
     public required IReadOnlyList<DiagnosticRecord> ResolvedDiagnostics { get; init; }
@@ -648,6 +781,27 @@ public sealed record VerificationReport
     public required AnalysisSnapshot CurrentAnalysis { get; init; }
     public required bool HasRegressions { get; init; }
     public bool HasExecutionFailures { get; init; }
+}
+
+public sealed record ReferenceReviewReport
+{
+    public int SchemaVersion { get; init; } = SchemaVersions.Current;
+    public required string Reference { get; init; }
+    public required string BaseCommit { get; init; }
+    public required string HeadCommit { get; init; }
+    public required DateTimeOffset VerifiedAtUtc { get; init; }
+    public required IReadOnlyList<string> ChangedFiles { get; init; }
+    public required IReadOnlyList<GitFileChange> Changes { get; init; }
+    public required IReadOnlyList<string> Projects { get; init; }
+    public required IReadOnlyList<SymbolRecord> Symbols { get; init; }
+    public required IReadOnlyList<SymbolRecord> ChangedSymbols { get; init; }
+    public required IReadOnlyList<string> Tests { get; init; }
+    public required IReadOnlyList<string> TestCases { get; init; }
+    public required BuildSnapshot CurrentBuild { get; init; }
+    public required TestSnapshot CurrentTests { get; init; }
+    public required AnalysisSnapshot CurrentAnalysis { get; init; }
+    public required bool HasFailures { get; init; }
+    public required bool HasExecutionFailures { get; init; }
 }
 
 public sealed record StatusReport
@@ -665,6 +819,8 @@ public sealed record AffectedReport
 {
     public int SchemaVersion { get; init; } = SchemaVersions.Current;
     public required IReadOnlyList<string> ChangedFiles { get; init; }
+    public IReadOnlyList<GitFileChange> Changes { get; init; } = [];
+    public GitComparisonState GitComparison { get; init; } = GitComparisonState.Comparable;
     public required IReadOnlyList<string> Projects { get; init; }
     public required IReadOnlyList<SymbolRecord> Symbols { get; init; }
     public IReadOnlyList<SymbolRecord> ChangedSymbols { get; init; } = [];

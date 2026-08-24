@@ -10,6 +10,180 @@ namespace DevContext.Tests;
 public sealed class ProjectIndexerTests
 {
     [TestMethod]
+    public async Task ProjectIndexer_UsesSolutionScopeAndTransitiveNonCSharpReferences()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"dev-context-solution-scope-{Guid.NewGuid():N}");
+        try
+        {
+            await WriteFileAsync(
+                Path.Combine(root, "Scope.sln"),
+                "Project(\"{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}\") = \"App.Tests\", \"tests\\App.Tests\\App.Tests.csproj\", \"{11111111-1111-1111-1111-111111111111}\"");
+            await WriteFileAsync(
+                Path.Combine(root, "tests", "App.Tests", "App.Tests.csproj"),
+                "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework><IsTestProject>true</IsTestProject></PropertyGroup><ItemGroup><ProjectReference Include=\"../../src/Library/Library.fsproj\" /></ItemGroup></Project>");
+            await WriteFileAsync(
+                Path.Combine(root, "tests", "App.Tests", "LibraryTests.cs"),
+                "public class LibraryTests;");
+            await WriteFileAsync(
+                Path.Combine(root, "src", "Library", "Library.fsproj"),
+                "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup><ItemGroup><Compile Include=\"Library.fs\" /></ItemGroup></Project>");
+            await WriteFileAsync(
+                Path.Combine(root, "src", "Library", "Library.fs"),
+                "module Library");
+            await WriteFileAsync(
+                Path.Combine(root, "excluded", "Excluded.csproj"),
+                "<Project Sdk=\"Microsoft.NET.Sdk\" />");
+
+            var repository = await new ProjectIndexer(new StubProcessRunner("{}")).BuildAsync(
+                root,
+                new DevContextConfig { Solution = "Scope.sln" },
+                CancellationToken.None);
+
+            CollectionAssert.AreEqual(
+                new[] { "src/Library/Library.fsproj", "tests/App.Tests/App.Tests.csproj" },
+                repository.Projects.Select(project => project.Path).ToArray());
+            Assert.IsFalse(repository.Projects.Any(project => project.Path == "excluded/Excluded.csproj"));
+            var (symbols, dependencies) = await SymbolIndexer.BuildAsync(
+                root,
+                repository,
+                new IndexingConfig { ExecuteSourceGenerators = false },
+                CancellationToken.None);
+            var fsharpCompleteness = symbols.CompilationCompleteness.Single(record =>
+                record.Project == "src/Library/Library.fsproj");
+            Assert.AreEqual(AnalysisCompletenessState.Partial, fsharpCompleteness.State);
+            StringAssert.Contains(fsharpCompleteness.Gaps.Single(), "F# project ownership");
+            var owner = ProjectOwnershipResolver.Explain("src/Library/Library.fs", repository.Projects).Single();
+            Assert.AreEqual("src/Library/Library.fsproj", owner.ProjectPath);
+
+            var graph = new RepositoryGraph(repository, symbols, dependencies, "hash", false);
+            var affected = AffectedCalculator.Calculate(
+                graph,
+                new GitChangeSet(
+                    "base",
+                    "head",
+                    GitComparisonState.Comparable,
+                    [new GitFileChange("src/Library/Library.fs", GitChangeProvenance.Committed)]));
+            CollectionAssert.Contains(affected.Projects.ToArray(), "src/Library/Library.fsproj");
+            CollectionAssert.Contains(affected.Projects.ToArray(), "tests/App.Tests/App.Tests.csproj");
+            CollectionAssert.Contains(affected.Tests.ToArray(), "tests/App.Tests/App.Tests.csproj");
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    [TestMethod]
+    public async Task ProjectIndexer_SupportsSlnxAndSlnfScope()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"dev-context-solution-formats-{Guid.NewGuid():N}");
+        try
+        {
+            await WriteFileAsync(
+                Path.Combine(root, "src", "App", "App.csproj"),
+                "<Project Sdk=\"Microsoft.NET.Sdk\" />");
+            await WriteFileAsync(
+                Path.Combine(root, "excluded", "Excluded.csproj"),
+                "<Project Sdk=\"Microsoft.NET.Sdk\" />");
+            await WriteFileAsync(
+                Path.Combine(root, "Scope.slnx"),
+                "<Solution><Folder Name=\"/src/\"><Project Path=\"src/App/App.csproj\" /></Folder></Solution>");
+            await WriteFileAsync(
+                Path.Combine(root, "Scope.slnf"),
+                "{\"solution\":{\"path\":\"Scope.sln\",\"projects\":[\"src/App/App.csproj\"]}}");
+            await WriteFileAsync(
+                Path.Combine(root, "Scope.sln"),
+                "Project(\"{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}\") = \"App\", \"src\\App\\App.csproj\", \"{11111111-1111-1111-1111-111111111111}\"");
+
+            foreach (var solution in new[] { "Scope.slnx", "Scope.slnf" })
+            {
+                var repository = await new ProjectIndexer(new StubProcessRunner("{}")).BuildAsync(
+                    root,
+                    new DevContextConfig { Solution = solution },
+                    CancellationToken.None);
+
+                Assert.HasCount(1, repository.Projects, solution);
+                Assert.AreEqual("src/App/App.csproj", repository.Projects.Single().Path, solution);
+            }
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    [TestMethod]
+    public async Task ProjectIndexer_AppliesConfiguredProjectExcludes()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"dev-context-project-exclude-{Guid.NewGuid():N}");
+        try
+        {
+            await WriteFileAsync(Path.Combine(root, "src", "App.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\" />");
+            await WriteFileAsync(Path.Combine(root, "artifacts", "Consumer.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\" />");
+            var evaluation = JsonSerializer.Serialize(new
+            {
+                Properties = new Dictionary<string, string> { ["AssemblyName"] = "App" },
+                Items = new Dictionary<string, object>()
+            });
+            var runner = new StubProcessRunner(evaluation, "{}");
+
+            var repository = await new ProjectIndexer(runner).BuildAsync(
+                root,
+                new DevContextConfig
+                {
+                    Indexing = new IndexingConfig
+                    {
+                        RespectGitignore = false,
+                        Exclude = ["artifacts/**"]
+                    }
+                },
+                CancellationToken.None);
+
+            Assert.HasCount(1, repository.Projects);
+            Assert.AreEqual("src/App.csproj", repository.Projects.Single().Path);
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    [TestMethod]
+    public async Task ProjectIndexer_BoundsParallelProjectEvaluation()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"dev-context-project-parallelism-{Guid.NewGuid():N}");
+        try
+        {
+            for (var index = 0; index < 4; index++)
+            {
+                await WriteFileAsync(
+                    Path.Combine(root, $"Project{index}", $"Project{index}.csproj"),
+                    "<Project Sdk=\"Microsoft.NET.Sdk\" />");
+            }
+
+            var runner = new DelayedProcessRunner();
+            var repository = await new ProjectIndexer(runner).BuildAsync(
+                root,
+                new DevContextConfig
+                {
+                    Indexing = new IndexingConfig
+                    {
+                        ExecuteSourceGenerators = false,
+                        MaxParallelism = 2
+                    }
+                },
+                CancellationToken.None);
+
+            Assert.HasCount(4, repository.Projects);
+            Assert.AreEqual(2, runner.MaxConcurrency);
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    [TestMethod]
     public async Task ProjectIndexer_EvaluatesBlazorRazorComponents()
     {
         var root = Path.Combine(Path.GetTempPath(), $"dev-context-blazor-{Guid.NewGuid():N}");
@@ -24,7 +198,7 @@ public sealed class ProjectIndexerTests
 
             var repository = await new ProjectIndexer(new ProcessRunner()).BuildAsync(
                 root,
-                new DevContextConfig { Solution = "BlazorApp.sln" },
+                new DevContextConfig(),
                 CancellationToken.None);
 
             CollectionAssert.Contains(
@@ -62,7 +236,7 @@ public sealed class ProjectIndexerTests
             var runner = new CapturingProcessRunner(new ProcessRunner());
             var repository = await new ProjectIndexer(runner).BuildAsync(
                 root,
-                new DevContextConfig { Solution = "WpfApp.sln" },
+                new DevContextConfig(),
                 CancellationToken.None);
             var projectFiles = repository.Projects.Single().ProjectFiles.ToArray();
 
@@ -146,7 +320,7 @@ public sealed class ProjectIndexerTests
 
             var repository = await new ProjectIndexer(runner).BuildAsync(
                 root,
-                new DevContextConfig { Solution = "App.sln" },
+                new DevContextConfig(),
                 CancellationToken.None);
 
             var project = repository.Projects.Single();
@@ -230,7 +404,7 @@ public sealed class ProjectIndexerTests
 
             var repository = await new ProjectIndexer(runner).BuildAsync(
                 root,
-                new DevContextConfig { Solution = "App.sln" },
+                new DevContextConfig(),
                 CancellationToken.None);
 
             var project = repository.Projects.Single();
@@ -274,7 +448,7 @@ public sealed class ProjectIndexerTests
 
             var repository = await new ProjectIndexer(runner).BuildAsync(
                 root,
-                new DevContextConfig { Solution = "App.sln" },
+                new DevContextConfig(),
                 CancellationToken.None);
 
             var project = repository.Projects.Single();
@@ -314,6 +488,8 @@ public sealed class ProjectIndexerTests
 
     private sealed class StubProcessRunner(params string[] outputs) : IProcessRunner
     {
+        private readonly object gate = new();
+
         public List<IReadOnlyList<string>> Calls { get; } = [];
 
         public Task<ProcessResult> RunAsync(
@@ -322,8 +498,13 @@ public sealed class ProjectIndexerTests
             string workingDirectory,
             CancellationToken cancellationToken)
         {
-            Calls.Add(arguments);
-            var output = outputs[Math.Min(Calls.Count - 1, outputs.Length - 1)];
+            string output;
+            lock (gate)
+            {
+                Calls.Add(arguments);
+                output = outputs[Math.Min(Calls.Count - 1, outputs.Length - 1)];
+            }
+
             return Task.FromResult(new ProcessResult(
                 ExecutionState.Succeeded,
                 0,
@@ -334,8 +515,58 @@ public sealed class ProjectIndexerTests
         }
     }
 
+    private sealed class DelayedProcessRunner : IProcessRunner
+    {
+        private int active;
+        private int maxConcurrency;
+
+        public int MaxConcurrency => Volatile.Read(ref maxConcurrency);
+
+        public async Task<ProcessResult> RunAsync(
+            string executable,
+            IReadOnlyList<string> arguments,
+            string workingDirectory,
+            CancellationToken cancellationToken)
+        {
+            var concurrency = Interlocked.Increment(ref active);
+            UpdateMaximum(concurrency);
+            try
+            {
+                await Task.Delay(75, cancellationToken);
+                return new ProcessResult(
+                    ExecutionState.Failed,
+                    1,
+                    string.Empty,
+                    "deliberate fallback",
+                    75,
+                    "dotnet msbuild");
+            }
+            finally
+            {
+                Interlocked.Decrement(ref active);
+            }
+        }
+
+        private void UpdateMaximum(int candidate)
+        {
+            var current = Volatile.Read(ref maxConcurrency);
+            while (candidate > current)
+            {
+                var observed = Interlocked.CompareExchange(ref maxConcurrency, candidate, current);
+                if (observed == current)
+                {
+                    return;
+                }
+
+                current = observed;
+            }
+        }
+    }
+
     private sealed class CapturingProcessRunner(IProcessRunner inner) : IProcessRunner
     {
+        private readonly object gate = new();
+
         public List<ProcessResult> Results { get; } = [];
 
         public async Task<ProcessResult> RunAsync(
@@ -345,7 +576,11 @@ public sealed class ProjectIndexerTests
             CancellationToken cancellationToken)
         {
             var result = await inner.RunAsync(executable, arguments, workingDirectory, cancellationToken);
-            Results.Add(result);
+            lock (gate)
+            {
+                Results.Add(result);
+            }
+
             return result;
         }
     }

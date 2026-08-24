@@ -24,7 +24,9 @@ internal sealed class VerificationService(
             new BaselineReference(baseline, baselineSymbols, baselineDependencies),
             cancellationToken);
 
-        var changedFiles = GitService.ChangedSince(baseline.Git, current.Git);
+        var changes = current.Changes
+                      ?? throw new InvalidOperationException("Verification did not produce a Git change set.");
+        var changedFiles = changes.ChangedFiles;
         var baselineDiagnostics = baseline.Analysis.Diagnostics.ToDictionary(
             diagnostic => diagnostic.Identity,
             StringComparer.Ordinal);
@@ -93,6 +95,8 @@ internal sealed class VerificationService(
             BaselineId = baseline.Manifest.BaselineId,
             VerifiedAtUtc = DateTimeOffset.UtcNow,
             ChangedFiles = changedFiles,
+            Changes = changes.Changes,
+            GitComparison = changes.Comparison,
             ChangedSymbols = current.Affected?.ChangedSymbols ?? [],
             NewDiagnostics = newDiagnostics,
             ResolvedDiagnostics = resolvedDiagnostics,
@@ -104,7 +108,7 @@ internal sealed class VerificationService(
             CurrentAnalysis = current.Analysis,
             HasRegressions = buildRegressed || formatRegressed || qodanaRegressed
                              || policyDiagnostics || newFailures.Length > 0,
-            HasExecutionFailures = executionFailed
+            HasExecutionFailures = executionFailed || !changes.IsComplete
         };
 
         await store.SaveCurrentAsync(repositoryRoot, current, config, report, cancellationToken);

@@ -37,6 +37,7 @@ internal sealed class ProcessRunner : IProcessRunner
             {
                 FileName = executable,
                 WorkingDirectory = workingDirectory,
+                RedirectStandardInput = true,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
@@ -52,6 +53,7 @@ internal sealed class ProcessRunner : IProcessRunner
         try
         {
             process.Start();
+            process.StandardInput.Close();
         }
         catch (Win32Exception exception)
         {

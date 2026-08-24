@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 5,
+  "baselineId": "schema-v5-fixture",
+  "createdAtUtc": "2026-01-01T00:00:00+00:00",
+  "repositoryRoot": "C:/fixture",
+  "branch": null,
+  "headCommit": null,
+  "workingTreeDirty": false,
+  "sdkVersion": "8.0.100",
+  "timings": []
+}

@@ -6,6 +6,7 @@ internal sealed record CliArguments(
     string Format,
     string Purpose,
     string Scope,
+    string Relation,
     string? AnalysisTarget,
     string? CoveragePath,
     string? OutputPath,
@@ -20,6 +21,10 @@ internal sealed record CliArguments(
     bool IncludeTests,
     string? ProjectFilter,
     IReadOnlyList<string> Kinds,
+    string? FromReference,
+    string? AgainstReference,
+    bool ExplainGaps,
+    bool NoCache,
     bool Replace,
     bool Verbose,
     bool Help,
@@ -32,6 +37,7 @@ internal sealed record CliArguments(
         var format = "text";
         var purpose = "change";
         var scope = "automatic";
+        var relation = "callers";
         string? analysisTarget = null;
         string? coveragePath = null;
         string? outputPath = null;
@@ -46,6 +52,10 @@ internal sealed record CliArguments(
         var includeTests = true;
         string? projectFilter = null;
         var kinds = new List<string>();
+        string? fromReference = null;
+        string? againstReference = null;
+        var explainGaps = false;
+        var noCache = false;
         var replace = false;
         var verbose = false;
         var help = false;
@@ -64,6 +74,12 @@ internal sealed record CliArguments(
                     break;
                 case "--replace":
                     replace = true;
+                    break;
+                case "--explain-gaps":
+                    explainGaps = true;
+                    break;
+                case "--no-cache":
+                    noCache = true;
                     break;
                 case "--changed":
                     changedOnly = true;
@@ -93,6 +109,9 @@ internal sealed record CliArguments(
                 case "--scope":
                     scope = NextValue(args, ref index, "--scope").ToLowerInvariant();
                     break;
+                case "--relation":
+                    relation = NextValue(args, ref index, "--relation").ToLowerInvariant();
+                    break;
                 case "--target":
                     analysisTarget = NextValue(args, ref index, "--target");
                     break;
@@ -108,6 +127,12 @@ internal sealed record CliArguments(
                 case "--kind":
                     kinds.AddRange(NextValue(args, ref index, "--kind")
                         .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+                    break;
+                case "--from":
+                    fromReference = NextValue(args, ref index, "--from");
+                    break;
+                case "--against":
+                    againstReference = NextValue(args, ref index, "--against");
                     break;
                 case "--max-hotspots":
                     maxHotspots = PositiveInteger(NextValue(args, ref index, "--max-hotspots"), "--max-hotspots");
@@ -167,6 +192,7 @@ internal sealed record CliArguments(
             format,
             purpose,
             scope,
+            relation,
             analysisTarget,
             coveragePath,
             outputPath,
@@ -181,6 +207,10 @@ internal sealed record CliArguments(
             includeTests,
             projectFilter,
             kinds.Distinct(StringComparer.OrdinalIgnoreCase).ToArray(),
+            fromReference,
+            againstReference,
+            explainGaps,
+            noCache,
             replace,
             verbose,
             help,

@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 7,
+  "baselineId": "schema-v7-fixture",
+  "createdAtUtc": "2026-01-01T00:00:00+00:00",
+  "repositoryRoot": "/fixture",
+  "branch": "main",
+  "headCommit": "1111111111111111111111111111111111111111",
+  "workingTreeDirty": false,
+  "sdkVersion": "9.0.100",
+  "timings": []
+}

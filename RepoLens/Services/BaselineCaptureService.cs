@@ -15,12 +15,14 @@ internal sealed record CaptureBundle(
     SymbolIndex Symbols,
     DependencyIndex Dependencies,
     AffectedReport? Affected,
+    GitChangeSet? Changes,
     IReadOnlyDictionary<string, string> RawLogs);
 
 internal enum CapturePurpose
 {
     Baseline,
-    Verification
+    Verification,
+    ReferenceReview
 }
 
 internal sealed record BaselineReference(
@@ -42,7 +44,8 @@ internal sealed class BaselineCaptureService(
         string? baselineId,
         CapturePurpose purpose,
         BaselineReference? baseline,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? reviewReference = null)
     {
         var id = baselineId ?? CreateBaselineId();
         var timings = new List<StageTiming>();
@@ -65,27 +68,50 @@ internal sealed class BaselineCaptureService(
         rawLogs["build.log"] = buildLog;
 
         AffectedReport? affected = null;
-        if (purpose == CapturePurpose.Verification
-            && config.Tests.VerifyMode is "affected-first" or "affected-only")
+        GitChangeSet? changes = null;
+        if (purpose == CapturePurpose.Verification)
         {
             if (baseline is null)
             {
                 throw new InvalidOperationException(
-                    "Affected test execution requires a stored baseline and indexes.");
+                    "Verification requires a stored baseline and indexes.");
             }
 
+            changes = await gitService.ChangesSinceAsync(
+                repositoryRoot,
+                baseline.Status.Git,
+                git,
+                cancellationToken);
+        }
+
+        if (purpose == CapturePurpose.ReferenceReview)
+        {
+            if (string.IsNullOrWhiteSpace(reviewReference))
+            {
+                throw new InvalidOperationException("Reference review requires a Git reference.");
+            }
+
+            changes = await gitService.ChangesAgainstReferenceAsync(
+                repositoryRoot,
+                reviewReference,
+                git,
+                cancellationToken);
+            affected = AffectedCalculator.Calculate(graph, changes);
+        }
+
+        if (purpose == CapturePurpose.Verification
+            && config.Tests.VerifyMode is "affected-first" or "affected-only")
+        {
             affected = AffectedCalculator.Calculate(
-                baseline.Status,
+                baseline!.Status,
                 baseline.Symbols,
                 baseline.Dependencies,
-                git,
-                graph);
+                graph,
+                changes!);
         }
 
         var testPlan = new TestExecutionPlan(
-            purpose == CapturePurpose.Baseline
-                ? config.Tests.BaselineMode
-                : config.Tests.VerifyMode,
+            purpose == CapturePurpose.Baseline ? config.Tests.BaselineMode : config.Tests.VerifyMode,
             affected);
 
         var ((tests, testLog), testTiming) = await TimedAsync(
@@ -119,6 +145,7 @@ internal sealed class BaselineCaptureService(
             RepositoryRoot = repositoryRoot.Replace('\\', '/'),
             Branch = git.Branch,
             HeadCommit = git.HeadCommit,
+            CapturedHeadCommit = git.HeadCommit,
             WorkingTreeDirty = git.Files.Count > 0,
             SdkVersion = sdkResult.State == ExecutionState.Succeeded
                 ? sdkResult.StandardOutput.Trim()
@@ -138,6 +165,7 @@ internal sealed class BaselineCaptureService(
             graph.Symbols,
             graph.Dependencies,
             affected,
+            changes,
             rawLogs);
     }
 

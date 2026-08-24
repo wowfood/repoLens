@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Xml.Linq;
 using DevContext.Configuration;
 using DevContext.Core;
@@ -6,8 +7,22 @@ using DevContext.Infrastructure;
 
 namespace DevContext.Services;
 
-internal sealed class ProjectIndexer(IProcessRunner processRunner)
+internal sealed record ProjectIndexBuildResult(
+    RepositoryIndex Repository,
+    IReadOnlySet<string> EvaluatedProjects,
+    IReadOnlySet<string> ReusedProjects);
+
+internal sealed class ProjectIndexer
 {
+    private readonly IProcessRunner processRunner;
+    private readonly RepositoryFileFilter fileFilter;
+
+    public ProjectIndexer(IProcessRunner processRunner, RepositoryFileFilter? fileFilter = null)
+    {
+        this.processRunner = processRunner;
+        this.fileFilter = fileFilter ?? new RepositoryFileFilter(processRunner);
+    }
+
     private static readonly string[] ProjectItemNames =
     [
         "Compile",
@@ -36,23 +51,196 @@ internal sealed class ProjectIndexer(IProcessRunner processRunner)
         DevContextConfig config,
         CancellationToken cancellationToken)
     {
-        var projects = Directory.EnumerateFiles(repositoryRoot, "*.csproj", SearchOption.AllDirectories)
-            .Where(path => !IsGeneratedPath(path))
-            .Order(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
+        var inventory = await fileFilter.GetFilesAsync(repositoryRoot, config.Indexing, cancellationToken);
+        return await BuildAsync(repositoryRoot, config, inventory, cancellationToken);
+    }
 
-        var records = new List<ProjectRecord>(projects.Length);
-        foreach (var project in projects)
+    internal async Task<RepositoryIndex> BuildAsync(
+        string repositoryRoot,
+        DevContextConfig config,
+        RepositoryFileInventory inventory,
+        CancellationToken cancellationToken) =>
+        (await BuildAsync(
+            repositoryRoot,
+            config,
+            inventory,
+            new Dictionary<string, ProjectRecord>(StringComparer.OrdinalIgnoreCase),
+            cancellationToken)).Repository;
+
+    internal async Task<ProjectIndexBuildResult> BuildAsync(
+        string repositoryRoot,
+        DevContextConfig config,
+        RepositoryFileInventory inventory,
+        IReadOnlyDictionary<string, ProjectRecord> reusableProjects,
+        CancellationToken cancellationToken)
+    {
+        var availableProjects = inventory.RelativePaths
+            .Where(IsSupportedProjectPath)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var selectedProjects = SelectConfiguredProjects(repositoryRoot, config.Solution, availableProjects);
+        var pending = selectedProjects.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var processed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var records = new Dictionary<string, ProjectRecord>(StringComparer.OrdinalIgnoreCase);
+        var evaluatedProjects = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var reusedProjectPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        while (pending.Count > 0)
         {
-            records.Add(await ReadProjectAsync(repositoryRoot, project, cancellationToken));
+            var wave = pending
+                .Where(path => availableProjects.Contains(path) && !processed.Contains(path))
+                .Order(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            pending.Clear();
+            if (wave.Length == 0)
+            {
+                break;
+            }
+
+            var projectsToEvaluate = wave
+                .Where(path => !reusableProjects.ContainsKey(path))
+                .ToArray();
+            var evaluated = await ParallelWork.SelectAsync(
+                projectsToEvaluate,
+                config.Indexing.MaxParallelism,
+                async (relativeProject, token) => await ReadProjectAsync(
+                    repositoryRoot,
+                    RepositoryFileFilter.ToFullPath(repositoryRoot, relativeProject),
+                    token),
+                cancellationToken);
+            var evaluatedByPath = projectsToEvaluate
+                .Select((path, index) => (path, Project: evaluated[index]))
+                .ToDictionary(item => item.path, item => item.Project, StringComparer.OrdinalIgnoreCase);
+            for (var index = 0; index < wave.Length; index++)
+            {
+                var relativeProject = wave[index];
+                var project = reusableProjects.TryGetValue(relativeProject, out var reusable)
+                    ? reusable
+                    : evaluatedByPath[relativeProject];
+                if (reusable is null)
+                {
+                    evaluatedProjects.Add(relativeProject);
+                }
+                else
+                {
+                    reusedProjectPaths.Add(relativeProject);
+                }
+
+                processed.Add(relativeProject);
+                records[relativeProject] = project;
+                foreach (var reference in project.ProjectReferences
+                             .Where(availableProjects.Contains)
+                             .Where(reference => !processed.Contains(reference)))
+                {
+                    pending.Add(reference);
+                }
+            }
         }
 
-        return new RepositoryIndex
-        {
-            Solution = config.Solution,
-            Projects = records.OrderBy(project => project.Path, StringComparer.Ordinal).ToArray()
-        };
+        return new ProjectIndexBuildResult(
+            new RepositoryIndex
+            {
+                Solution = config.Solution,
+                Projects = records.Values.OrderBy(project => project.Path, StringComparer.Ordinal).ToArray()
+            },
+            evaluatedProjects,
+            reusedProjectPaths);
     }
+
+    private static IReadOnlyList<string> SelectConfiguredProjects(
+        string repositoryRoot,
+        string? configuredSolution,
+        IReadOnlySet<string> availableProjects)
+    {
+        if (string.IsNullOrWhiteSpace(configuredSolution))
+        {
+            return availableProjects.Order(StringComparer.Ordinal).ToArray();
+        }
+
+        var solutionPath = Path.GetFullPath(Path.Combine(
+            repositoryRoot,
+            configuredSolution.Replace('/', Path.DirectorySeparatorChar)));
+        if (!File.Exists(solutionPath))
+        {
+            throw new InvalidOperationException($"Configured solution does not exist: {configuredSolution}");
+        }
+
+        var projects = Path.GetExtension(solutionPath).ToLowerInvariant() switch
+        {
+            ".sln" => ReadSlnProjects(repositoryRoot, solutionPath),
+            ".slnx" => ReadSlnxProjects(repositoryRoot, solutionPath),
+            ".slnf" => ReadSlnfProjects(repositoryRoot, solutionPath),
+            _ => throw new InvalidOperationException(
+                $"Configured solution must be a .sln, .slnx, or .slnf file: {configuredSolution}")
+        };
+        return projects
+            .Where(availableProjects.Contains)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    private static IReadOnlyList<string> ReadSlnProjects(string repositoryRoot, string solutionPath) =>
+        File.ReadLines(solutionPath)
+            .Select(line => Regex.Match(
+                line,
+                "^Project\\(\"[^\"]+\"\\) = \"[^\"]*\", \"([^\"]+)\",",
+                RegexOptions.CultureInvariant))
+            .Where(match => match.Success)
+            .Select(match => ResolveSolutionProject(repositoryRoot, solutionPath, match.Groups[1].Value))
+            .Where(IsSupportedProjectPath)
+            .ToArray();
+
+    private static IReadOnlyList<string> ReadSlnxProjects(string repositoryRoot, string solutionPath) =>
+        XDocument.Load(solutionPath, LoadOptions.None)
+            .Descendants()
+            .Where(element => element.Name.LocalName == "Project")
+            .Select(element => element.Attribute("Path")?.Value)
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Select(path => ResolveSolutionProject(repositoryRoot, solutionPath, path!))
+            .Where(IsSupportedProjectPath)
+            .ToArray();
+
+    private static IReadOnlyList<string> ReadSlnfProjects(string repositoryRoot, string solutionPath)
+    {
+        using var document = JsonDocument.Parse(File.ReadAllText(solutionPath));
+        if (!document.RootElement.TryGetProperty("solution", out var solution)
+            || !solution.TryGetProperty("path", out var referencedSolutionElement)
+            || referencedSolutionElement.ValueKind != JsonValueKind.String
+            || !solution.TryGetProperty("projects", out var projects)
+            || projects.ValueKind != JsonValueKind.Array)
+        {
+            throw new InvalidOperationException(
+                $"Solution filter must contain solution.path and a solution.projects array: {solutionPath}");
+        }
+
+        var referencedSolution = Path.GetFullPath(Path.Combine(
+            Path.GetDirectoryName(solutionPath)!,
+            referencedSolutionElement.GetString()!.Replace('\\', Path.DirectorySeparatorChar)));
+        if (!File.Exists(referencedSolution))
+        {
+            throw new InvalidOperationException(
+                $"Solution filter references a missing solution: {referencedSolutionElement.GetString()}");
+        }
+
+        return projects.EnumerateArray()
+            .Where(element => element.ValueKind == JsonValueKind.String)
+            .Select(element => element.GetString())
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Select(path => ResolveSolutionProject(repositoryRoot, referencedSolution, path!))
+            .Where(IsSupportedProjectPath)
+            .ToArray();
+    }
+
+    private static string ResolveSolutionProject(
+        string repositoryRoot,
+        string solutionPath,
+        string projectPath) => NormalizeRelative(
+        repositoryRoot,
+        Path.GetFullPath(Path.Combine(
+            Path.GetDirectoryName(solutionPath)!,
+            projectPath.Replace('\\', Path.DirectorySeparatorChar))));
+
+    private static bool IsSupportedProjectPath(string path) =>
+        Path.GetExtension(path).ToLowerInvariant() is ".csproj" or ".fsproj" or ".vbproj";
 
     private async Task<ProjectRecord> ReadProjectAsync(
         string repositoryRoot,
@@ -399,7 +587,13 @@ internal sealed class ProjectIndexer(IProcessRunner processRunner)
             .Select(path => NormalizeRelative(repositoryRoot, Path.GetFullPath(Path.Combine(projectDirectory, path!))))
             .Order(StringComparer.Ordinal)
             .ToArray();
-        var sourceItems = Directory.EnumerateFiles(projectDirectory, "*.cs", SearchOption.AllDirectories)
+        var sourceExtension = Path.GetExtension(projectPath).ToLowerInvariant() switch
+        {
+            ".fsproj" => "*.fs",
+            ".vbproj" => "*.vb",
+            _ => "*.cs"
+        };
+        var sourceItems = Directory.EnumerateFiles(projectDirectory, sourceExtension, SearchOption.AllDirectories)
             .Where(path => !IsGeneratedPath(path))
             .Where(path => IsRepositoryFile(repositoryRoot, path))
             .Select(path => new ProjectItemRecord("Compile", NormalizeRelative(repositoryRoot, path)))

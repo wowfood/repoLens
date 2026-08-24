@@ -9,13 +9,13 @@ internal sealed class ContextStore
     public bool BaselineExists(string repositoryRoot) =>
         File.Exists(Path.Combine(ContextPaths.Baseline(repositoryRoot), "manifest.json"));
 
-    public async Task SaveConfigIfNewAsync(
+    public async Task SaveConfigIfNeededAsync(
         string repositoryRoot,
         DevContextConfig config,
-        bool isNew,
+        bool shouldSave,
         CancellationToken cancellationToken)
     {
-        if (isNew)
+        if (shouldSave)
         {
             await JsonFile.WriteAsync(ContextPaths.Config(repositoryRoot), config, cancellationToken);
         }
@@ -159,6 +159,21 @@ internal sealed class ContextStore
                 value => value.SchemaVersion,
                 cancellationToken)
         );
+
+    public async Task<TestSnapshot> ReadLatestTestsAsync(
+        string repositoryRoot,
+        CancellationToken cancellationToken)
+    {
+        EnsureBaseline(repositoryRoot);
+        var currentTests = Path.Combine(ContextPaths.Current(repositoryRoot), "tests.json");
+        var path = File.Exists(currentTests)
+            ? currentTests
+            : Path.Combine(ContextPaths.Baseline(repositoryRoot), "tests.json");
+        return await ReadValidatedAsync<TestSnapshot>(
+            path,
+            value => value.SchemaVersion,
+            cancellationToken);
+    }
 
     public void Reset(string repositoryRoot)
     {

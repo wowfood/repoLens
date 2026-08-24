@@ -194,7 +194,11 @@ function Remove-SmokeFixtureSafely {
 
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
-    $OutputDirectory = Join-Path $repositoryRoot ('artifacts\smoke\' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
+    $OutputDirectory = [IO.Path]::Combine(
+        $repositoryRoot,
+        'artifacts',
+        'smoke',
+        (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
 }
 elseif (-not [IO.Path]::IsPathRooted($OutputDirectory)) {
     $OutputDirectory = Join-Path (Get-Location).Path $OutputDirectory
@@ -202,7 +206,13 @@ elseif (-not [IO.Path]::IsPathRooted($OutputDirectory)) {
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 [IO.Directory]::CreateDirectory($OutputDirectory) | Out-Null
 
-$script:DevContextDll = Join-Path $repositoryRoot "RepoLens\bin\$Configuration\net10.0\dev-context.dll"
+$script:DevContextDll = [IO.Path]::Combine(
+    $repositoryRoot,
+    'RepoLens',
+    'bin',
+    $Configuration,
+    'net10.0',
+    'dev-context.dll')
 $solutionPath = Join-Path $repositoryRoot 'RepoLens.sln'
 if (-not $NoBuild) {
     Write-Host 'Building dev-context and its tests...'
@@ -240,7 +250,7 @@ $testProject = @'
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="MSTest" Version="4.0.2" />
-    <ProjectReference Include="..\..\src\Calculator\Calculator.csproj" />
+    <ProjectReference Include="../../src/Calculator/Calculator.csproj" />
   </ItemGroup>
   <ItemGroup>
     <Using Include="Microsoft.VisualStudio.TestTools.UnitTesting" />
@@ -285,8 +295,8 @@ $badlyFormattedSource = $calculatorSource.Replace(
 try {
     Write-Host "Creating isolated fixture: $fixtureRoot"
     [IO.Directory]::CreateDirectory($fixtureRoot) | Out-Null
-    $calculatorDirectory = Join-Path $fixtureRoot 'src\Calculator'
-    $testDirectory = Join-Path $fixtureRoot 'tests\Calculator.Tests'
+    $calculatorDirectory = [IO.Path]::Combine($fixtureRoot, 'src', 'Calculator')
+    $testDirectory = [IO.Path]::Combine($fixtureRoot, 'tests', 'Calculator.Tests')
     [IO.Directory]::CreateDirectory($calculatorDirectory) | Out-Null
     [IO.Directory]::CreateDirectory($testDirectory) | Out-Null
 
@@ -305,8 +315,8 @@ TestResults/
     [void](Invoke-Checked 'dotnet' @('new', 'sln', '--name', 'SmokeSample', '--format', 'sln') $fixtureRoot)
     [void](Invoke-Checked 'dotnet' @(
         'sln', 'SmokeSample.sln', 'add',
-        'src\Calculator\Calculator.csproj',
-        'tests\Calculator.Tests\Calculator.Tests.csproj') $fixtureRoot)
+        'src/Calculator/Calculator.csproj',
+        'tests/Calculator.Tests/Calculator.Tests.csproj') $fixtureRoot)
     [void](Invoke-Checked 'git' @('init', '--quiet') $fixtureRoot)
     [void](Invoke-Checked 'git' @('add', '.') $fixtureRoot)
     [void](Invoke-Checked 'git' @(
@@ -356,16 +366,16 @@ TestResults/
             '--logger', 'console;verbosity=normal') $fixtureRoot)
     Add-TranscriptSection $rawContext 'Evaluated production project metadata' (
         Invoke-External 'dotnet' @(
-            'msbuild', 'src\Calculator\Calculator.csproj', '-nologo',
+            'msbuild', 'src/Calculator/Calculator.csproj', '-nologo',
             '-getProperty:TargetFramework,Nullable,LangVersion,TreatWarningsAsErrors',
             '-getItem:ProjectReference,PackageReference,Compile') $fixtureRoot)
     Add-TranscriptSection $rawContext 'Evaluated test project metadata' (
         Invoke-External 'dotnet' @(
-            'msbuild', 'tests\Calculator.Tests\Calculator.Tests.csproj', '-nologo',
+            'msbuild', 'tests/Calculator.Tests/Calculator.Tests.csproj', '-nologo',
             '-getProperty:TargetFramework,Nullable,LangVersion,IsTestProject',
             '-getItem:ProjectReference,PackageReference,Compile') $fixtureRoot)
 
-    $configPath = Join-Path $fixtureRoot '.dev-context\config.json'
+    $configPath = [IO.Path]::Combine($fixtureRoot, '.dev-context', 'config.json')
     $configObject = Get-Content -Raw -LiteralPath $configPath | ConvertFrom-Json -Depth 50
     $configObject.analysis.dotnetFormat = $true
     Write-Utf8File $configPath ($configObject | ConvertTo-Json -Depth 50)
@@ -432,7 +442,7 @@ TestResults/
     Write-Utf8File (Join-Path $OutputDirectory 'verify-regression.txt') $regression.StandardOut
 
     $currentManifest = Get-Content -Raw -LiteralPath (
-        Join-Path $fixtureRoot '.dev-context\current\manifest.json') | ConvertFrom-Json -Depth 50
+        [IO.Path]::Combine($fixtureRoot, '.dev-context', 'current', 'manifest.json')) | ConvertFrom-Json -Depth 50
     if ($currentManifest.repositoryIndexCacheHit -ne $true) {
         throw 'Verification did not reuse the repository graph cache populated by affected analysis.'
     }

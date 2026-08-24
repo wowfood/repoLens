@@ -251,11 +251,13 @@ public sealed class RepositoryAndSymbolTests
             Assert.IsTrue(symbols.Symbols.Any(symbol => symbol.Name == "Value"
                                                         && symbol.Kind == "property"
                                                         && symbol.File.StartsWith("generated://", StringComparison.Ordinal)));
-            Assert.HasCount(1, symbols.GeneratedSources);
+            Assert.IsTrue(symbols.Symbols.Any(symbol => symbol.Name == "FirstIncrementalWidget"));
+            Assert.IsTrue(symbols.Symbols.Any(symbol => symbol.Name == "SecondIncrementalWidget"));
+            Assert.HasCount(3, symbols.GeneratedSources);
             var completeness = symbols.CompilationCompleteness.Single();
             Assert.IsTrue(completeness.SourceGeneratorsExecuted);
-            Assert.IsGreaterThanOrEqualTo(1, completeness.SourceGeneratorsDiscovered);
-            Assert.AreEqual(1, completeness.GeneratedSourceFiles);
+            Assert.IsGreaterThanOrEqualTo(3, completeness.SourceGeneratorsDiscovered);
+            Assert.AreEqual(3, completeness.GeneratedSourceFiles);
         }
         finally
         {
@@ -1032,5 +1034,23 @@ public sealed class RepoLensTestSourceGenerator : ISourceGenerator
         SourceText.From(
             "namespace Sample; public sealed class GeneratedWidget { public string Value { get; } = \"ok\"; }",
             Encoding.UTF8));
+}
+
+[Generator]
+public sealed class RepoLensFirstIncrementalGenerator : IIncrementalGenerator
+{
+    public void Initialize(IncrementalGeneratorInitializationContext context) =>
+        context.RegisterPostInitializationOutput(output => output.AddSource(
+            "FirstIncrementalWidget.g.cs",
+            "namespace Generated; public sealed class FirstIncrementalWidget { }"));
+}
+
+[Generator]
+public sealed class RepoLensSecondIncrementalGenerator : IIncrementalGenerator
+{
+    public void Initialize(IncrementalGeneratorInitializationContext context) =>
+        context.RegisterPostInitializationOutput(output => output.AddSource(
+            "SecondIncrementalWidget.g.cs",
+            "namespace Generated; public sealed class SecondIncrementalWidget { }"));
 }
 #pragma warning restore RS1041, RS1042, RS1036

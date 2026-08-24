@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$Configuration = 'Release',
-    [string]$Version = '0.7.0',
+    [string]$Version = '0.11.0',
     [string]$PackageDirectory = 'artifacts/packages'
 )
 

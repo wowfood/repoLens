@@ -30,9 +30,21 @@ internal sealed class RepositoryIntelligenceService(
             baseline = await store.ReadStatusAsync(repositoryRoot, cancellationToken);
         }
 
-        var changedFiles = baseline is null
-            ? currentGit.Files.Select(file => file.Path).Order(StringComparer.Ordinal).ToArray()
-            : GitService.ChangedSince(baseline.Git, currentGit);
+        var changes = baseline is null
+            ? new GitChangeSet(
+                null,
+                currentGit.HeadCommit,
+                GitComparisonState.Comparable,
+                currentGit.Files
+                    .OrderBy(file => file.Path, StringComparer.Ordinal)
+                    .Select(file => new GitFileChange(file.Path, GitChangeProvenance.WorkingTree))
+                    .ToArray())
+            : await gitService.ChangesSinceAsync(
+                repositoryRoot,
+                baseline.Git,
+                currentGit,
+                cancellationToken);
+        var changedFiles = changes.ChangedFiles;
         var scope = options.Scope == ContextScope.Automatic
             ? options.Purpose == ContextPurpose.Change
                 ? ContextScope.ChangedFiles
@@ -52,7 +64,12 @@ internal sealed class RepositoryIntelligenceService(
             .Where(outcome => TestService.IsFailed(outcome.Outcome))
             .OrderBy(outcome => outcome.Name, StringComparer.Ordinal)
             .ToArray() ?? [];
-        var coverage = ReadCobertura(repositoryRoot, options.CoberturaPath);
+        var coveragePaths = !string.IsNullOrWhiteSpace(options.CoberturaPath)
+            ? new[] { options.CoberturaPath }
+            : baseline is null
+                ? []
+                : (await store.ReadLatestTestsAsync(repositoryRoot, cancellationToken)).CoverageFiles;
+        var coverage = ReadCobertura(repositoryRoot, coveragePaths);
         var churn = await ReadGitHistoryAsync(
             repositoryRoot,
             options.GitHistoryMonths,
@@ -97,6 +114,8 @@ internal sealed class RepositoryIntelligenceService(
             AnalyzedProjects = selection.Projects.Order(StringComparer.OrdinalIgnoreCase).ToArray(),
             AnalyzedFiles = selection.Files.Order(StringComparer.OrdinalIgnoreCase).ToArray(),
             ChangedFiles = changedFiles,
+            Changes = changes.Changes,
+            GitComparison = changes.Comparison,
             Diagnostics = diagnostics,
             FailingTests = failingTests,
             ProjectDependencies = dependencies,
@@ -129,7 +148,7 @@ internal sealed class RepositoryIntelligenceService(
             throw new ArgumentOutOfRangeException(nameof(retain), "Retention must be at least one report.");
         }
 
-        var reportsRoot = Path.Combine(ContextPaths.Root(repositoryRoot), "reports");
+        var reportsRoot = ContextPaths.Reports(repositoryRoot);
         var resolvedPath = string.IsNullOrWhiteSpace(outputPath)
             ? Path.Combine(
                 reportsRoot,
@@ -139,6 +158,28 @@ internal sealed class RepositoryIntelligenceService(
                 : Path.Combine(repositoryRoot, outputPath));
         Directory.CreateDirectory(Path.GetDirectoryName(resolvedPath)!);
         await File.WriteAllTextAsync(resolvedPath, report.Markdown, cancellationToken);
+        var trendPath = Path.ChangeExtension(resolvedPath, ".trend.json");
+        var coverageValues = report.Hotspots
+            .Where(hotspot => hotspot.LineCoveragePercent is not null)
+            .Select(hotspot => hotspot.LineCoveragePercent!.Value)
+            .ToArray();
+        await JsonFile.WriteAsync(
+            trendPath,
+            new RepositoryTrendPoint
+            {
+                GeneratedAtUtc = report.GeneratedAtUtc,
+                ReportPath = RelativeOrAbsolutePath(repositoryRoot, resolvedPath),
+                Purpose = report.Purpose,
+                Scope = report.Scope,
+                Target = report.Target,
+                DiagnosticCount = report.Diagnostics.Count,
+                FailingTestCount = report.FailingTests.Count,
+                HotspotCount = report.Hotspots.Count,
+                HotspotChurn = report.Hotspots.Sum(hotspot => hotspot.Churn),
+                HotspotsWithCoverage = coverageValues.Length,
+                AverageLineCoveragePercent = coverageValues.Length == 0 ? null : coverageValues.Average()
+            },
+            cancellationToken);
 
         if (Path.GetFullPath(Path.GetDirectoryName(resolvedPath)!)
             .Equals(Path.GetFullPath(reportsRoot), StringComparison.OrdinalIgnoreCase))
@@ -148,6 +189,11 @@ internal sealed class RepositoryIntelligenceService(
                          .Skip(retain))
             {
                 File.Delete(stale);
+                var staleTrend = Path.ChangeExtension(stale, ".trend.json");
+                if (File.Exists(staleTrend))
+                {
+                    File.Delete(staleTrend);
+                }
             }
         }
 
@@ -155,6 +201,76 @@ internal sealed class RepositoryIntelligenceService(
             resolvedPath,
             report.Markdown.Length,
             report.ApproximateTokens);
+    }
+
+    public async Task<RepositoryTrendReport> TrendAsync(
+        string repositoryRoot,
+        int maxPoints,
+        CancellationToken cancellationToken)
+    {
+        if (maxPoints < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxPoints), "The trend point bound must be positive.");
+        }
+
+        var reportsRoot = ContextPaths.Reports(repositoryRoot);
+        if (!Directory.Exists(reportsRoot))
+        {
+            return new RepositoryTrendReport
+            {
+                GeneratedAtUtc = DateTimeOffset.UtcNow,
+                Points = []
+            };
+        }
+
+        var snapshots = new List<RepositoryTrendPoint>();
+        foreach (var path in Directory.EnumerateFiles(reportsRoot, "*.trend.json")
+                     .Order(StringComparer.OrdinalIgnoreCase))
+        {
+            var snapshot = await JsonFile.ReadAsync<RepositoryTrendPoint>(path, cancellationToken);
+            SchemaVersions.EnsureReadable(snapshot.SchemaVersion, Path.GetFileName(path));
+            snapshots.Add(snapshot);
+        }
+
+        var ordered = snapshots
+            .OrderBy(point => point.GeneratedAtUtc)
+            .ThenBy(point => point.ReportPath, StringComparer.Ordinal)
+            .ToArray();
+        var points = new List<RepositoryTrendPoint>(ordered.Length);
+        var previousBySeries = new Dictionary<
+            (ContextPurpose Purpose, ContextScope Scope, string? Target),
+            RepositoryTrendPoint>();
+        foreach (var point in ordered)
+        {
+            var series = (point.Purpose, point.Scope, point.Target);
+            previousBySeries.TryGetValue(series, out var previous);
+            points.Add(point with
+            {
+                DiagnosticDelta = previous is null ? null : point.DiagnosticCount - previous.DiagnosticCount,
+                FailingTestDelta = previous is null ? null : point.FailingTestCount - previous.FailingTestCount,
+                HotspotChurnDelta = previous is null ? null : point.HotspotChurn - previous.HotspotChurn,
+                AverageLineCoverageDelta = previous?.AverageLineCoveragePercent is null
+                                           || point.AverageLineCoveragePercent is null
+                    ? null
+                    : point.AverageLineCoveragePercent - previous.AverageLineCoveragePercent
+            });
+            previousBySeries[series] = point;
+        }
+
+        return new RepositoryTrendReport
+        {
+            GeneratedAtUtc = DateTimeOffset.UtcNow,
+            Points = points.TakeLast(maxPoints).ToArray()
+        };
+    }
+
+    private static string RelativeOrAbsolutePath(string repositoryRoot, string path)
+    {
+        var relative = Path.GetRelativePath(repositoryRoot, path).Replace('\\', '/');
+        return relative.Split('/', StringSplitOptions.RemoveEmptyEntries)
+            .FirstOrDefault() == ".."
+            ? Path.GetFullPath(path)
+            : relative;
     }
 
     public static string RenderMarkdown(RepositoryContextReport report)
@@ -167,6 +283,7 @@ internal sealed class RepositoryIntelligenceService(
         builder.AppendLine($"- Projects: {report.AnalyzedProjects.Count}");
         builder.AppendLine($"- Files: {report.AnalyzedFiles.Count}");
         builder.AppendLine($"- Changed files: {report.ChangedFiles.Count}");
+        builder.AppendLine($"- Git comparison: {report.GitComparison}");
         builder.AppendLine($"- Baseline diagnostics in scope: {report.Diagnostics.Count}");
         builder.AppendLine($"- Existing failing tests: {report.FailingTests.Count}");
         builder.AppendLine($"- Semantic compilations: " +
@@ -178,9 +295,19 @@ internal sealed class RepositoryIntelligenceService(
             .Where(record => record.State != AnalysisCompletenessState.Complete)
             .SelectMany(record => record.Gaps.Select(gap => $"`{record.Project}`: {gap}")));
 
+        if (report.GitComparison != GitComparisonState.Comparable)
+        {
+            AppendList(
+                builder,
+                "Git comparison gaps",
+                [$"Baseline comparison is {report.GitComparison}; committed changes may be incomplete."]);
+        }
+
         if (report.Purpose == ContextPurpose.Change)
         {
-            AppendList(builder, "Changed files", report.ChangedFiles);
+            AppendList(builder, "Changed files", report.Changes.Count == 0
+                ? report.ChangedFiles
+                : report.Changes.Select(change => $"`{change.Path}` ({ChangeLabel(change.Provenance)})"));
             AppendList(builder, "Affected projects", report.AnalyzedProjects);
             AppendSymbols(builder, report.Symbols);
             AppendTypeDefinitions(builder, report.TypeDefinitions);
@@ -629,30 +756,94 @@ internal sealed class RepositoryIntelligenceService(
         return metrics;
     }
 
-    private static IReadOnlyDictionary<string, double> ReadCobertura(string repositoryRoot, string? path)
+    internal static IReadOnlyDictionary<string, double> ReadCobertura(
+        string repositoryRoot,
+        IReadOnlyList<string> paths)
     {
-        if (string.IsNullOrWhiteSpace(path))
+        if (paths.Count == 0)
         {
             return new Dictionary<string, double>();
         }
 
-        var fullPath = Path.GetFullPath(Path.IsPathRooted(path) ? path : Path.Combine(repositoryRoot, path));
-        if (!File.Exists(fullPath))
+        var lineHits = new Dictionary<string, Dictionary<int, long>>(StringComparer.OrdinalIgnoreCase);
+        var fallbackRates = new Dictionary<string, List<double>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var path in paths.Distinct(StringComparer.OrdinalIgnoreCase))
         {
-            throw new FileNotFoundException("Cobertura coverage file was not found.", fullPath);
+            var fullPath = Path.GetFullPath(Path.IsPathRooted(path) ? path : Path.Combine(repositoryRoot, path));
+            if (!File.Exists(fullPath))
+            {
+                throw new FileNotFoundException("Cobertura coverage file was not found.", fullPath);
+            }
+
+            foreach (var element in XDocument.Load(fullPath).Descendants()
+                         .Where(element => element.Name.LocalName == "class"))
+            {
+                var file = element.Attribute("filename")?.Value?.Replace('\\', '/').TrimStart('/');
+                if (string.IsNullOrWhiteSpace(file))
+                {
+                    continue;
+                }
+
+                var lines = element.Descendants()
+                    .Where(child => child.Name.LocalName == "line")
+                    .Select(child => new
+                    {
+                        Number = int.TryParse(
+                            child.Attribute("number")?.Value,
+                            NumberStyles.Integer,
+                            CultureInfo.InvariantCulture,
+                            out var number) ? number : (int?)null,
+                        Hits = long.TryParse(
+                            child.Attribute("hits")?.Value,
+                            NumberStyles.Integer,
+                            CultureInfo.InvariantCulture,
+                            out var hits) ? hits : (long?)null
+                    })
+                    .Where(line => line.Number is not null && line.Hits is not null)
+                    .ToArray();
+                if (lines.Length > 0)
+                {
+                    if (!lineHits.TryGetValue(file, out var hitsByLine))
+                    {
+                        hitsByLine = new Dictionary<int, long>();
+                        lineHits[file] = hitsByLine;
+                    }
+
+                    foreach (var line in lines)
+                    {
+                        hitsByLine[line.Number!.Value] = Math.Max(
+                            hitsByLine.GetValueOrDefault(line.Number.Value),
+                            line.Hits!.Value);
+                    }
+                }
+                else if (double.TryParse(
+                             element.Attribute("line-rate")?.Value,
+                             NumberStyles.Float,
+                             CultureInfo.InvariantCulture,
+                             out var rate))
+                {
+                    if (!fallbackRates.TryGetValue(file, out var rates))
+                    {
+                        rates = [];
+                        fallbackRates[file] = rates;
+                    }
+
+                    rates.Add(Math.Clamp(rate * 100d, 0d, 100d));
+                }
+            }
         }
 
         var result = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
-        foreach (var element in XDocument.Load(fullPath).Descendants().Where(element => element.Name.LocalName == "class"))
+        foreach (var (file, hitsByLine) in lineHits)
         {
-            var file = element.Attribute("filename")?.Value?.Replace('\\', '/').TrimStart('/');
-            if (string.IsNullOrWhiteSpace(file)
-                || !double.TryParse(element.Attribute("line-rate")?.Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var rate))
-            {
-                continue;
-            }
+            result[file] = hitsByLine.Count == 0
+                ? 0d
+                : hitsByLine.Count(pair => pair.Value > 0) * 100d / hitsByLine.Count;
+        }
 
-            result[file] = Math.Clamp(rate * 100d, 0d, 100d);
+        foreach (var (file, rates) in fallbackRates.Where(pair => !result.ContainsKey(pair.Key)))
+        {
+            result[file] = rates.Average();
         }
 
         return result;
@@ -839,6 +1030,14 @@ internal sealed class RepositoryIntelligenceService(
         parameter.Constraints.Count == 0
             ? $"`{parameter.Name}`"
             : $"`{parameter.Name} : {string.Join(", ", parameter.Constraints)}`";
+
+    private static string ChangeLabel(GitChangeProvenance provenance) => provenance switch
+    {
+        GitChangeProvenance.Committed => "committed",
+        GitChangeProvenance.WorkingTree => "working tree",
+        GitChangeProvenance.Both => "committed + working tree",
+        _ => provenance.ToString()
+    };
 
     private static int EstimateTokens(string text) => (int)Math.Ceiling(text.Length / 4d);
 
