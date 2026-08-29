@@ -11,7 +11,7 @@ design notes remain as the decision record.
 | Projects | `RepoLens` (CLI, net10.0, tool `dev-context`), `RepoLens.Api` (net8.0 library, shares source via `Compile Include`), `RepoLens.Tests` |
 | Packages | CLI and API 0.11.0 |
 | Build | Release build and package-consumer validation clean; `TreatWarningsAsErrors`, 0 warnings |
-| Tests | 80 passing |
+| Tests | 78 passing |
 | Commands | `init`, `baseline`, `status`, `verify`, `affected`, `doctor`, `explain`, `context`, `query`, `refs`, `mcp`, `benchmark`, `report`, `trend`, `schema`, `clean`, `reset` |
 | Configuration | v2 current; v1 is migrated with backward-compatible defaults on `init` or baseline save |
 | Persisted schema | v10, readable window v5–v10; executable manifest fixtures cover every readable version |
@@ -19,7 +19,7 @@ design notes remain as the decision record.
 | CI | `windows-latest`, `ubuntu-latest`, and `macos-latest`; restore, Release build, test, pack API + CLI, net8 consumer, smoke test, retrieval benchmark |
 | Agent integration | Two repository Codex skills under `.agents/skills`, the installable/user-level `start-coding-task` workflow, and a stdio MCP server with seven typed tools |
 
-Latest local release-gate evidence: 80/80 tests passing; retrieval benchmark 100% file recall,
+Latest local release-gate evidence: 78/78 tests passing; retrieval benchmark 100% file recall,
 93.8% file precision, and 10,559 approximate tokens; smoke-test context reduction 97.31%.
 The fresh 0.11.0 task baseline built the repository graph in approximately 10.9 s on this workstation;
 warm evidence queries complete in roughly 0.5–0.7 s.
