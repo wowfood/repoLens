@@ -1,0 +1,4 @@
+# Normalize line endings for all text files to LF in the repository,
+# regardless of the platform or editor used to create or check them out.
+# This prevents whole-file diffs caused only by CRLF/LF mismatches.
+* text=auto eol=lf
