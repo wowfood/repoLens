@@ -4,9 +4,6 @@
         <TargetFramework>net8.0</TargetFramework>
         <AssemblyName>RepoLens.Api</AssemblyName>
         <RootNamespace>DevContext</RootNamespace>
-        <ImplicitUsings>enable</ImplicitUsings>
-        <Nullable>enable</Nullable>
-        <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
         <PackageId>RepoLens.Api</PackageId>
         <Version>0.11.0</Version>
         <Description>Reusable deterministic repository analysis, baselines, affected-code discovery, and verification for .NET applications.</Description>

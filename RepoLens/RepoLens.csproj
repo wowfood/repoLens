@@ -5,9 +5,6 @@
         <TargetFramework>net10.0</TargetFramework>
         <AssemblyName>dev-context</AssemblyName>
         <RootNamespace>DevContext</RootNamespace>
-        <ImplicitUsings>enable</ImplicitUsings>
-        <Nullable>enable</Nullable>
-        <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
         <PackAsTool>true</PackAsTool>
         <ToolCommandName>dev-context</ToolCommandName>
         <PackageId>DevContext.Cli</PackageId>
