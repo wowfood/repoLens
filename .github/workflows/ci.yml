@@ -27,6 +27,16 @@ jobs:
             10.0.x
       - name: Restore
         run: dotnet restore RepoLens.sln
+      - name: Check for vulnerable NuGet packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          output=$(dotnet list RepoLens.sln package --vulnerable --include-transitive 2>&1)
+          echo "$output"
+          if echo "$output" | grep -q "has the following vulnerable packages"; then
+            echo "::error::Vulnerable NuGet packages detected"
+            exit 1
+          fi
       - name: Build
         run: dotnet build RepoLens.sln --configuration Release --no-restore
       - name: Test
