@@ -332,6 +332,14 @@ remain visible.
 Deletes `baseline/`, `current/`, `indexes/`, `cache/`, retained runs, `fingerprints.json`, and
 `summary.md`. It retains `.dev-context/config.json` and never changes application source files.
 
+`context` and `report` render the full narrative by default, because a retained report is written
+for a person to read. Passing `--max-tokens` bounds it: whole detail sections are dropped -- type
+definitions first, then symbols, then hotspots, least structural first -- never a sentence cut in
+half, and what was dropped is stated in `analysisGaps` and shown in the report itself. `truncated`
+records that it happened, and the summary counters keep describing what was analyzed rather than what
+survived the rendering. The MCP `context` tool always passes a ceiling, defaulting to 8,000 tokens,
+because an unbounded whole-repository narrative rendered about 54,000 tokens on this repository.
+
 ## Configuration
 
 Run `dev-context init` to create `.dev-context/config.json` explicitly. The first `baseline` also

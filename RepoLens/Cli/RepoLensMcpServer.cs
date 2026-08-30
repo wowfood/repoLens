@@ -217,7 +217,7 @@ internal sealed class RepoLensMcpTools(DevContextApi api)
         GuardAsync(() => api.ExplainAsync(path, cancellationToken));
 
     [McpServerTool(Name = "context", UseStructuredContent = true, ReadOnly = true)]
-    [Description("Build change, architecture, build, or risk context from deterministic repository evidence. Returns a rendered narrative plus decision-relevant records; ask for symbols explicitly when you need them. The narrative grows with scope, so pass scope=project or scope=changed with a target on a large repository rather than defaulting to the whole thing; check approximateTokens in the result. Does not build or run tests.")]
+    [Description("Build change, architecture, build, or risk context from deterministic repository evidence. Returns a rendered narrative plus decision-relevant records; ask for symbols explicitly when you need them. The narrative is bounded by maxTokens: detail is dropped to fit and the omission is stated in analysisGaps, so a truncated result is visibly truncated. Scoping with scope=project or scope=changed and a target still gives a better answer than a bounded whole-repository one. Does not build or run tests.")]
     public async Task<McpContextResult> ContextAsync(
         [Description("Context purpose: change, architecture, build, or risk.")] string purpose = "change",
         [Description("Scope: automatic, full, changed, project, or path.")] string scope = "automatic",
@@ -227,6 +227,7 @@ internal sealed class RepoLensMcpTools(DevContextApi api)
         [Description("Maximum symbol records to analyze; must be positive.")] int maxSymbols = 50,
         [Description("Include the full symbol list in the result. Off by default because it is large and the narrative usually answers the question.")] bool includeSymbols = false,
         [Description("Git history window in months; must be positive.")] int historyMonths = 12,
+        [Description("Approximate token ceiling for the rendered narrative; minimum 256. Whole detail sections are dropped to fit and the omission is disclosed in analysisGaps.")] int maxTokens = 8000,
         CancellationToken cancellationToken = default) =>
         McpContextResult.From(
             await GuardAsync(() => api.ContextAsync(
@@ -238,7 +239,12 @@ internal sealed class RepoLensMcpTools(DevContextApi api)
                     CoberturaPath = coveragePath,
                     MaxHotspots = Positive(maxHotspots, nameof(maxHotspots)),
                     MaxSymbols = Positive(maxSymbols, nameof(maxSymbols)),
-                    GitHistoryMonths = Positive(historyMonths, nameof(historyMonths))
+                    GitHistoryMonths = Positive(historyMonths, nameof(historyMonths)),
+
+                    // Always bounded here, unlike the CLI. An unbounded repository-scope narrative
+                    // rendered about 53,900 tokens, which no client can use; the tool description
+                    // telling callers to scope the request instead was a workaround, not a bound.
+                    MaxTokens = AtLeast(maxTokens, 256, nameof(maxTokens))
                 },
                 cancellationToken)),
             includeSymbols);

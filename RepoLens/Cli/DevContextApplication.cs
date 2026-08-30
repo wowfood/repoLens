@@ -475,7 +475,11 @@ internal static class DevContextApplication
             CoberturaPath = arguments.CoveragePath,
             MaxHotspots = arguments.MaxHotspots,
             MaxSymbols = arguments.MaxSymbols,
-            GitHistoryMonths = arguments.HistoryMonths
+            GitHistoryMonths = arguments.HistoryMonths,
+
+            // Opt-in for the CLI. A retained report is written for a person to read, and one that was
+            // quietly shortened would misrepresent the repository rather than describe it.
+            MaxTokens = arguments.MaxTokensSpecified ? arguments.MaxTokens : null
         };
     }
 
