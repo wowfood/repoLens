@@ -385,14 +385,23 @@ internal sealed class ProjectIndexer
                     GetItemValue(item, "FrameworkReferenceName")))
                 .Where(reference => reference.Path.Length > 0 && File.Exists(reference.Path))
                 .DistinctBy(reference => reference.Path, StringComparer.OrdinalIgnoreCase)
-                .OrderBy(reference => reference.Path, StringComparer.OrdinalIgnoreCase)
+                // File name before full path. Ordering by the absolute path alone is
+                // deterministic on one machine but not across machines: the SDK lives under
+                // /usr/share on Linux, /usr/local on macOS and Program Files on Windows, so
+                // the same reference set comes out in a different order on each. The file
+                // name identifies the reference wherever it was resolved from.
+                .OrderBy(
+                    reference => Path.GetFileName(reference.Path),
+                    StringComparer.OrdinalIgnoreCase)
+                .ThenBy(reference => reference.Path, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
             analyzers = ReadItems(items, "Analyzer")
                 .Select(item => GetItemValue(item, "FullPath") ?? GetItemValue(item, "Identity"))
                 .Where(path => !string.IsNullOrWhiteSpace(path) && File.Exists(path))
                 .Select(path => path!)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
-                .Order(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(path => path, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
             globalUsings = ReadItems(items, "Using")
                 .Select(item => new GlobalUsingRecord(

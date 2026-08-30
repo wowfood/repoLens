@@ -51,24 +51,39 @@ $volatileKeys = @(
     'branch'
 )
 
-$root = (Resolve-Path $RepositoryRoot).Path
-$rootPattern = [regex]::Escape(($root -replace '\\', '/'))
+$root = ($RepositoryRoot | Resolve-Path).Path -replace '\\', '/'
+
+# macOS resolves the temporary directory through a /private symlink, so the path recorded in the
+# index carries a prefix the resolved root does not. Without the alias the substitution produced
+# "/private<repo>/..." and every macOS path compared unequal.
+$rootAliases = @($root, "/private$root") | Sort-Object -Property Length -Descending
 
 function ConvertTo-NormalText {
     param([string]$Value)
+
     $normalized = $Value -replace '\\', '/'
-    $normalized = [regex]::Replace($normalized, $rootPattern, '<repo>', 'IgnoreCase')
-    # A rooted path outside the repository is machine state: the home directory and the resolved SDK
-    # patch version both appear in NuGet reference-assembly paths. Only the leaf is kept, so the
-    # reference keeps its identity and its position in the list while the location is discarded.
-    # Collapsing the whole path to one token instead would make every reference compare equal and
-    # hide a genuinely reordered or truncated reference set.
-    # Spaces are allowed inside the match ("C:/Program Files/dotnet/sdk/10.0.204/...") because
-    # stopping at whitespace would leave the SDK version in the tail, which is exactly the part that
-    # differs between runner images.
-    $normalized = [regex]::Replace($normalized, '(?i)\b[a-z]:/[^"]*', { param($match) '<abs>/' + [System.IO.Path]::GetFileName($match.Value) })
-    $normalized = [regex]::Replace($normalized, '(?<![\w<])/(?:Users|home|private|tmp|var|opt)/[^"]*', { param($match) '<abs>/' + [System.IO.Path]::GetFileName($match.Value) })
-    return $normalized
+    foreach ($alias in $rootAliases) {
+        $normalized = [regex]::Replace($normalized, [regex]::Escape($alias), '<repo>', 'IgnoreCase')
+    }
+
+    # Any remaining rooted path is machine state — the SDK lives under Program Files on Windows,
+    # /usr/share on Linux, and /usr/local on macOS — so only the leaf is kept. The leaf keeps the
+    # reference's identity and its position in the list, where collapsing the whole path to a single
+    # token would make every reference compare equal and hide a reordered or truncated set.
+    #
+    # Detected by shape rather than by a list of known prefixes. The earlier version matched
+    # /Users, /home, /private, /tmp, /var and /opt, which meant Linux paths under /usr were not
+    # normalized at all: that leg produced a dump 25% larger than the others and every comparison
+    # against it failed for a reason that had nothing to do with RepoLens.
+    if ($normalized -match '^(?:[A-Za-z]:)?/' ) {
+        return '<abs>/' + [System.IO.Path]::GetFileName($normalized)
+    }
+
+    # Absolute paths embedded in a longer string, such as a compiler diagnostic.
+    return [regex]::Replace(
+        $normalized,
+        '(?i)(?<![\w<])(?:[a-z]:)?/[^"]*',
+        { param($match) '<abs>/' + [System.IO.Path]::GetFileName($match.Value) })
 }
 
 function ConvertTo-NormalNode {
