@@ -408,7 +408,12 @@ public sealed class ApiIntegrationTests
             Assert.AreEqual(bundle.BundleId, repeated.BundleId);
             Assert.AreEqual(bundle.Prompt, repeated.Prompt);
             Assert.AreNotEqual(bundle.BundleId, smallestBudget.BundleId);
-            Assert.IsLessThanOrEqualTo(256, smallestBudget.ApproximateTokens);
+            // The floor budget is honoured for evidence unconditionally; it yields only to the last
+            // surviving analysis gap, and only once no evidence is left to give up instead.
+            Assert.IsEmpty(smallestBudget.Blocks);
+            Assert.IsLessThanOrEqualTo(
+                256 + smallestBudget.AnalysisGaps.Sum(gap => gap.Length / 4 + 1),
+                smallestBudget.ApproximateTokens);
             Assert.IsFalse(bundle.Prompt.Contains(repository, StringComparison.OrdinalIgnoreCase));
             StringAssert.Contains(bundle.Prompt, "Evidence sufficiency:");
             StringAssert.EndsWith(bundle.Prompt, options.Query + Environment.NewLine);

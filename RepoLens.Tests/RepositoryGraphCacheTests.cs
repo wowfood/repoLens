@@ -40,6 +40,61 @@ public sealed class RepositoryGraphCacheTests
         }
     }
 
+    /// <summary>
+    /// The fingerprint table skips re-reading a file whose size and modification time are unchanged.
+    /// That is an optimization, and an optimization that can change an answer is a defect, so these
+    /// assertions are about the hash being identical with the table, without it, and across a fresh
+    /// service instance that had to reload it from disk.
+    /// </summary>
+    [TestMethod]
+    public async Task InputHash_IsUnaffectedByTheFingerprintTable()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"dev-context-fingerprints-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        try
+        {
+            var runner = new ProcessRunner();
+            var git = await runner.RunAsync("git", ["init", "--quiet"], root, CancellationToken.None);
+            Assert.AreEqual(DevContext.Core.ExecutionState.Succeeded, git.State, git.StandardError);
+            await File.WriteAllTextAsync(Path.Combine(root, "Sample.cs"), "public class First;");
+
+            var config = new DevContextConfig();
+            var first = new RepositoryGraphService(runner, new ProjectIndexer(runner));
+            var cold = await first.ComputeInputHashAsync(root, config, CancellationToken.None);
+            var warm = await first.ComputeInputHashAsync(root, config, CancellationToken.None);
+
+            // ComputeInputHashAsync does not build a graph, so nothing has written the table yet.
+            // Writing it here proves the reload path rather than the in-memory dictionary.
+            var table = FileFingerprintCache.PathFor(root);
+            var reloaded = new RepositoryGraphService(runner, new ProjectIndexer(runner));
+            var afterReload = await reloaded.ComputeInputHashAsync(root, config, CancellationToken.None);
+
+            Assert.AreEqual(cold, warm);
+            Assert.AreEqual(cold, afterReload);
+
+            // A same-length edit is the case the stat shortcut has to get right on its own: the
+            // length is identical, so only the modification time separates the two contents.
+            await File.WriteAllTextAsync(Path.Combine(root, "Sample.cs"), "public class Third;");
+            var afterSameLengthEdit = await reloaded.ComputeInputHashAsync(root, config, CancellationToken.None);
+            Assert.AreNotEqual(cold, afterSameLengthEdit);
+
+            if (File.Exists(table))
+            {
+                File.Delete(table);
+            }
+
+            var withoutTable = new RepositoryGraphService(runner, new ProjectIndexer(runner));
+            Assert.AreEqual(
+                afterSameLengthEdit,
+                await withoutTable.ComputeInputHashAsync(root, config, CancellationToken.None),
+                "Discarding the fingerprint table must cost speed and nothing else.");
+        }
+        finally
+        {
+            TempDirectory.Delete(root);
+        }
+    }
+
     [TestMethod]
     public async Task InputHash_IgnoresMachineDependentParallelism()
     {

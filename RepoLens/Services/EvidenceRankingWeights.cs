@@ -62,6 +62,12 @@ internal sealed record EvidenceRankingWeights
             or "member-read" or "member-write" => 115,
         "event-subscription" or "delegate-callback" => 105,
         "inheritance" or "interface" or "generic-type-argument" => 95,
+        "typeof-reference" => 90,
+        // An attribute says what kind of thing a declaration is, which is often the answer; a
+        // nameof is a name dependency that a rename breaks but that reads as weaker evidence of
+        // "these two are about the same subject" than a call or a construction.
+        "attribute" => 85,
+        "nameof-reference" => 80,
         "dependency-injection" or "markup-binding" or "markup-event" or "component-use" => 85,
         _ => 70
     };

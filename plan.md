@@ -236,7 +236,21 @@ Move to a per-project input hash with a project-level cache, so an edit re-index
 project and its dependents. The reverse project-reference closure needed to decide "and its
 dependents" already exists in `ProjectOwnershipResolver.ExpandAffectedProjects`.
 
-### 4.3 Stop forcing `doctor` cold
+### 4.3 Index footprint — measured, not yet reduced
+
+Compact serialization took the persisted indexes from 7,697 KB to 5,806 KB, and the CPU passes are
+done. What remains is structural, and each option below is measured on this repository so the next
+attempt is aimed rather than guessed. None of them is a free win, which is why none has been taken.
+
+| Target | Saving | What it costs |
+| --- | --- | --- |
+| Symbol identities | **~1.1 MB, ~18% of all indexes** | 64 hex characters twice per dependency edge (890 KB) and once per symbol and per type member (240 KB). Shortening to 16 hex characters is a ~2.7e-10 collision risk at 100k symbols, but it is a persisted-contract change: every stored identity moves, so an existing baseline silently stops matching a new index. Needs a schema bump, a detected format change, and a forced re-baseline with a clear message — not just a shorter hash. |
+| Duplicated member records | ~233 KB, ~10% of `symbols.json` | 1,387 of 1,773 type-definition members repeat `semanticName`, `file` and `line` verbatim from a `symbols.json` record already in the same document and addressable by the identity the member carries. The other 386 have no symbol record, so the fields would become conditionally present — the same ambiguity `DefaultIgnoreCondition = Never` exists to avoid. |
+| Nulls and empty collections | 343 KB, 5.5% | `DefaultIgnoreCondition = Never` writes `"parameters":[]` on 1,127 of 1,773 members and `"attributes":[]` on 1,624. Omitting them is free for deserialization but makes "no parameters" indistinguishable from "not indexed" for anything else reading the file, which is the distinction this product is built on. |
+| `generatedSources[].Text` | 176 KB, 3% | One generated file contributed 168 KB. It cannot simply be dropped, because generated source is retrievable evidence; it has to move to a side file loaded on demand, written by both the index and cache publish paths and readable after either is swapped. |
+| Cache duplication | ~2x the index size | Per-project cache entries duplicate each project's slice of the whole-graph files. Both are read, by different code paths, so removing either changes the reuse logic. |
+
+### 4.4 Stop forcing `doctor` cold
 
 `DevContextApi.DoctorAsync:223` builds the graph with `Cache = new CacheConfig { Enabled = false }`,
 which costs a measured 14.4 s on every run. Use the cache by default and add

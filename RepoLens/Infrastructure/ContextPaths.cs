@@ -14,6 +14,14 @@ internal static class ContextPaths
     public static string Cache(string repositoryRoot) => Path.Combine(Root(repositoryRoot), "cache");
 
     /// <summary>
+    /// Content hashes keyed by size and modification time, so a warm call re-reads only what changed.
+    /// It sits beside the cache rather than inside it because the cache directory is swapped
+    /// wholesale on publish, and this table is worth keeping across that swap.
+    /// </summary>
+    public static string Fingerprints(string repositoryRoot) =>
+        Path.Combine(Root(repositoryRoot), "fingerprints.json");
+
+    /// <summary>
     /// Held while the graph cache directory is swapped, so two dev-context processes analyzing the
     /// same repository cannot delete and rename it underneath one another.
     /// </summary>

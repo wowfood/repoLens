@@ -153,6 +153,15 @@ public sealed record RepositoryContextOptions
     public string? Target { get; init; }
     public int MaxHotspots { get; init; } = 10;
     public int MaxSymbols { get; init; } = 200;
+
+    /// <summary>
+    /// Ceiling on the rendered narrative, or <c>null</c> for no ceiling. Null is the default because
+    /// a retained Markdown report is written for a person and completeness matters more there than
+    /// size; the MCP server, whose payload has to fit inside somebody's context window, always sets
+    /// one. When the ceiling binds, whole detail sections are dropped -- never a sentence cut in half
+    /// -- and what was dropped is disclosed in <c>AnalysisGaps</c>.
+    /// </summary>
+    public int? MaxTokens { get; init; }
     public int GitHistoryMonths { get; init; } = 12;
     public string? CoberturaPath { get; init; }
 }
@@ -360,6 +369,14 @@ public sealed record RepositoryContextReport
     public IReadOnlyList<string> AnalysisGaps { get; init; } = [];
     public required string Markdown { get; init; }
     public required int ApproximateTokens { get; init; }
+
+    /// <summary>
+    /// Whether detail was dropped to fit <see cref="RepositoryContextOptions.MaxTokens"/>. Purely
+    /// additive, so no schema bump: an older build reading a report that carries it ignores the
+    /// property, and a newer build reading an older report reads it as false, which is what an
+    /// unbounded report was.
+    /// </summary>
+    public bool Truncated { get; init; }
 }
 
 public sealed record RepositoryReportArtifact(
@@ -715,6 +732,15 @@ public sealed record SymbolRecord(
 {
     public string? SemanticName { get; init; }
     public int? EndLine { get; init; }
+
+    /// <summary>
+    /// True when this record came from the declaration site that carries the body of a partial
+    /// type or member. Partial declarations share one identity, so only one record survives; this
+    /// decides which, and it is not persisted because it describes the choice rather than the
+    /// symbol.
+    /// </summary>
+    [JsonIgnore]
+    public bool IsPartialImplementation { get; init; }
 }
 
 public sealed record SourceLocationRecord(string File, int Line)

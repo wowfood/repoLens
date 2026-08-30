@@ -64,10 +64,18 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'git commit failed in the materialized fixture.' }
 
     if (-not $SkipRestore) {
-        & dotnet restore src/Ordering/Ordering.csproj | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw 'dotnet restore failed in the materialized fixture.' }
-        & dotnet restore tests/Ordering.Tests/Ordering.Tests.csproj | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw 'dotnet restore failed in the materialized fixture.' }
+        # Every project explicitly, including the one only reached as a ProjectReference. Restoring
+        # it transitively works, but leaves its assets file being written while the referencing
+        # restore is still running, and a fixture whose references half-resolve produces analysis
+        # gaps that inflate every bundle in the corpus by about a hundred tokens. That reads as a
+        # retrieval regression and is not one.
+        foreach ($project in @(
+            'src/Inventory/Inventory.csproj',
+            'src/Ordering/Ordering.csproj',
+            'tests/Ordering.Tests/Ordering.Tests.csproj')) {
+            & dotnet restore $project | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "dotnet restore failed for $project in the materialized fixture." }
+        }
     }
 }
 finally {

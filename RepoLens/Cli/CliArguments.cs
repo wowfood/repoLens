@@ -13,6 +13,13 @@ internal sealed record CliArguments(
     int MaxHotspots,
     int MaxSymbols,
     int MaxTokens,
+
+    /// <summary>
+    /// Whether --max-tokens was given explicitly. `query` always has a budget, but `context` and
+    /// `report` are unbounded unless asked, because a retained report is written for a person and a
+    /// silently shortened one would misrepresent the repository.
+    /// </summary>
+    bool MaxTokensSpecified,
     int MaxResults,
     int GraphDepth,
     int HistoryMonths,
@@ -44,6 +51,7 @@ internal sealed record CliArguments(
         var maxHotspots = 10;
         var maxSymbols = 200;
         var maxTokens = 3000;
+        var maxTokensSpecified = false;
         var maxResults = 20;
         var graphDepth = 1;
         var historyMonths = 12;
@@ -146,6 +154,7 @@ internal sealed record CliArguments(
                         "--max-tokens",
                         256,
                         int.MaxValue);
+                    maxTokensSpecified = true;
                     break;
                 case "--max-results":
                     maxResults = PositiveInteger(NextValue(args, ref index, "--max-results"), "--max-results");
@@ -199,6 +208,7 @@ internal sealed record CliArguments(
             maxHotspots,
             maxSymbols,
             maxTokens,
+            maxTokensSpecified,
             maxResults,
             graphDepth,
             historyMonths,

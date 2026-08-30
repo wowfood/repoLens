@@ -241,7 +241,11 @@ selection reasons, evidence relationships, a sufficient/partial/insufficient dec
 abstention flag, and known analysis gaps. JSON returns the typed `EvidenceBundle`, including content
 hashes, stable symbol identities, confidence labels, relationship origins and exact use-site spans,
 compilation completeness, and the same rendered prompt. `--max-tokens` uses the conservative
-`ceil(characters / 4)` estimate and has a minimum of 256. `--graph-depth` accepts zero through
+`ceil(characters / 4)` estimate and has a minimum of 256. Evidence is always what gets cut to make
+room: blocks are dropped, then the last one is truncated, then it is dropped too, and only then are
+analysis gaps trimmed. One concrete gap always survives beside the notice that others were omitted,
+so a bundle carrying nothing but disclosures may exceed the budget by that gap — a result may
+understate the evidence found, never the analysis missed. `--graph-depth` accepts zero through
 three; shallower queries use fewer graph-expanded results. Normal queries are stateless and do not
 require or create a baseline; changed-only selection reads but never replaces the baseline.
 
@@ -325,8 +329,16 @@ remain visible.
 
 ### `reset`
 
-Deletes `baseline/`, `current/`, `indexes/`, `cache/`, retained runs, and `summary.md`. It retains
-`.dev-context/config.json` and never changes application source files.
+Deletes `baseline/`, `current/`, `indexes/`, `cache/`, retained runs, `fingerprints.json`, and
+`summary.md`. It retains `.dev-context/config.json` and never changes application source files.
+
+`context` and `report` render the full narrative by default, because a retained report is written
+for a person to read. Passing `--max-tokens` bounds it: whole detail sections are dropped -- type
+definitions first, then symbols, then hotspots, least structural first -- never a sentence cut in
+half, and what was dropped is stated in `analysisGaps` and shown in the report itself. `truncated`
+records that it happened, and the summary counters keep describing what was analyzed rather than what
+survived the rendering. The MCP `context` tool always passes a ceiling, defaulting to 8,000 tokens,
+because an unbounded whole-repository narrative rendered about 54,000 tokens on this repository.
 
 ## Configuration
 
@@ -431,6 +443,7 @@ whose test suite legitimately runs longer.
     project-entries/
       <project-path-hash>.json
   cache.lock
+  fingerprints.json
   reports/
     <timestamp>-<purpose>.md
     <timestamp>-<purpose>.trend.json
@@ -441,6 +454,9 @@ whose test suite legitimately runs longer.
 
 `cache.lock` exists only while a process is swapping the cache directory into place, and is deleted
 when that process releases it.
+
+`fingerprints.json` records `(path, size, modified, content hash)` for every repository input. It sits
+beside the cache rather than inside it because the cache directory is swapped wholesale on publish.
 
 Every stored document has a schema version. Schema v10 adds persisted coverage provenance and
 structured retained-report trend points. Schema v9 adds commit-aware change provenance, an
@@ -469,6 +485,16 @@ Git-ignored paths, configured excludes, generated output, Git internals, IDE sta
 `.dev-context/` are excluded. On an exact cache miss, matching per-project entries are reused.
 A changed project and its reverse project-reference dependents are rebuilt; independent projects
 remain cached. `doctor` reports the reuse/rebuild counts.
+
+Those content hashes are read from `fingerprints.json` when a file's size and modification time both
+match the recorded ones, and computed from the file otherwise, in parallel. The cache key is still the
+content hash, so two runs over identical content still agree and nothing about determinism changes;
+what changes is that a warm call re-reads only what was edited instead of the whole repository. On a
+5,000-file repository that took a warm `explain` from 2.4 s to 1.3 s. The shortcut is only taken when
+`cache.enabled` is true — the switch that already trades freshness for speed — and it is wrong only
+for an edit that preserves a file's exact byte length *and* lands inside the filesystem's timestamp
+granularity. Deleting the file, or running with the cache disabled, forces a full re-read; it is an
+optimization that can never change an answer, only how long it takes to produce one.
 
 Concurrent callers of one process — overlapping MCP requests, most obviously — share a single graph
 build rather than each running a full evaluation. Between processes, the cache directory is published
