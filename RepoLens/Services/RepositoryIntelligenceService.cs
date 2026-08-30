@@ -82,10 +82,18 @@ internal sealed class RepositoryIntelligenceService(
                 "Git history was unavailable, so hotspot churn, contributor, and recency values are "
                 + "absent rather than zero.");
         }
+        // One read and one parse per scoped file, shared by both passes. Each used to read and parse
+        // every file in scope independently, so a whole-repository context did the work twice.
+        var sources = new ScopedSourceCache(repositoryRoot);
+        var symbolsByFile = graph.Symbols.Symbols.ToLookup(
+            symbol => symbol.File,
+            StringComparer.OrdinalIgnoreCase);
         var (types, methods) = await BuildCodeMetricsAsync(
             repositoryRoot,
             graph,
             selection,
+            sources,
+            symbolsByFile,
             cancellationToken);
         var hotspots = await BuildHotspotsAsync(
             repositoryRoot,
@@ -95,6 +103,8 @@ internal sealed class RepositoryIntelligenceService(
             coverage,
             churn.Metrics,
             options.MaxHotspots,
+            sources,
+            symbolsByFile,
             cancellationToken);
         var symbols = SelectSymbols(graph, selection, hotspots, options).ToArray();
         var typeDefinitions = SelectTypeDefinitions(graph, selection, hotspots, options).ToArray();
@@ -451,9 +461,51 @@ internal sealed class RepositoryIntelligenceService(
         IReadOnlyDictionary<string, double> coverage,
         IReadOnlyDictionary<string, GitHistoryMetric> history,
         int limit,
+        ScopedSourceCache sources,
+        ILookup<string, SymbolRecord> symbolsByFile,
         CancellationToken cancellationToken)
     {
         var symbolsByIdentity = graph.Symbols.Symbols.ToDictionary(symbol => symbol.Identity, StringComparer.Ordinal);
+
+        // Everything below used to be recomputed inside the per-file loop, each time with a full scan
+        // of the symbol table, the edge list, the diagnostics or the project list -- so the pass was
+        // quadratic in the size of the repository. Each of these is now one pass, done once.
+        var outgoingByFile = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        var incomingByFile = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var reference in graph.Dependencies.Symbols)
+        {
+            var hasSource = symbolsByIdentity.TryGetValue(reference.SourceSymbol, out var source);
+            if (hasSource)
+            {
+                Track(outgoingByFile, source!.File, reference.TargetSymbol);
+            }
+
+            if (hasSource && symbolsByIdentity.TryGetValue(reference.TargetSymbol, out var target))
+            {
+                Track(incomingByFile, target.File, reference.SourceSymbol);
+            }
+        }
+
+        var diagnosticsByFile = diagnostics
+            .Where(diagnostic => diagnostic.File is not null)
+            .GroupBy(
+                diagnostic => NormalizeDiagnosticPath(repositoryRoot, diagnostic.File!),
+                StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase);
+
+        // First project wins, matching the FirstOrDefault this replaces.
+        var projectByFile = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var candidate in graph.Repository.Projects)
+        {
+            foreach (var owned in candidate.SourceFiles)
+            {
+                if (!projectByFile.ContainsKey(owned))
+                {
+                    projectByFile[owned] = candidate.Path;
+                }
+            }
+        }
+
         var sourceFiles = selection.Files
             .Where(path => Path.GetExtension(path).Equals(".cs", StringComparison.OrdinalIgnoreCase))
             .Order(StringComparer.OrdinalIgnoreCase)
@@ -462,37 +514,20 @@ internal sealed class RepositoryIntelligenceService(
         foreach (var file in sourceFiles)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var fullPath = Path.GetFullPath(Path.Combine(repositoryRoot, file.Replace('/', Path.DirectorySeparatorChar)));
-            if (!File.Exists(fullPath))
+            var parsed = await sources.TryGetAsync(file, cancellationToken);
+            if (parsed is not { } entry)
             {
                 continue;
             }
 
-            var source = await File.ReadAllTextAsync(fullPath, cancellationToken);
-            var root = await CSharpSyntaxTree.ParseText(source, path: fullPath)
-                .GetRootAsync(cancellationToken);
-            var complexities = root.DescendantNodes()
+            var source = entry.Source;
+            var complexities = entry.Root.DescendantNodes()
                 .OfType<BaseMethodDeclarationSyntax>()
                 .Select(CyclomaticComplexity)
                 .ToArray();
-            var fileSymbols = graph.Symbols.Symbols
-                .Where(symbol => symbol.File.Equals(file, StringComparison.OrdinalIgnoreCase))
-                .Select(symbol => symbol.Identity)
-                .ToHashSet(StringComparer.Ordinal);
-            var outgoing = graph.Dependencies.Symbols
-                .Where(reference => fileSymbols.Contains(reference.SourceSymbol))
-                .Select(reference => reference.TargetSymbol)
-                .Distinct(StringComparer.Ordinal)
-                .Count();
-            var incoming = graph.Dependencies.Symbols
-                .Where(reference => fileSymbols.Contains(reference.TargetSymbol))
-                .Select(reference => reference.SourceSymbol)
-                .Where(symbolsByIdentity.ContainsKey)
-                .Distinct(StringComparer.Ordinal)
-                .Count();
-            var diagnosticCount = diagnostics.Count(diagnostic => diagnostic.File is not null
-                                                                  && NormalizeDiagnosticPath(repositoryRoot, diagnostic.File)
-                                                                      .Equals(file, StringComparison.OrdinalIgnoreCase));
+            var outgoing = outgoingByFile.TryGetValue(file, out var outgoingTargets) ? outgoingTargets.Count : 0;
+            var incoming = incomingByFile.TryGetValue(file, out var incomingSources) ? incomingSources.Count : 0;
+            var diagnosticCount = diagnosticsByFile.GetValueOrDefault(file);
             history.TryGetValue(file, out var git);
             var lineCoverage = TryFindCoverage(coverage, file);
             var maxComplexity = complexities.DefaultIfEmpty(0).Max();
@@ -506,9 +541,7 @@ internal sealed class RepositoryIntelligenceService(
             if (git?.Churn > 0) reasons.Add($"recent churn {git.Churn} across {git.CommitCount} commit(s)");
             if (reasons.Count == 0) reasons.Add("highest remaining deterministic rank in scope");
 
-            var project = graph.Repository.Projects
-                .FirstOrDefault(candidate => candidate.SourceFiles.Contains(file, StringComparer.OrdinalIgnoreCase))?.Path
-                ?? "(unowned)";
+            var project = projectByFile.GetValueOrDefault(file, "(unowned)");
             candidates.Add(new FileHotspot
             {
                 Rank = 0,
@@ -546,6 +579,8 @@ internal sealed class RepositoryIntelligenceService(
             string repositoryRoot,
             RepositoryGraph graph,
             ScopeSelection selection,
+            ScopedSourceCache sources,
+            ILookup<string, SymbolRecord> symbolsByFile,
             CancellationToken cancellationToken)
     {
         var symbolByIdentity = graph.Symbols.Symbols.ToDictionary(symbol => symbol.Identity, StringComparer.Ordinal);
@@ -559,18 +594,14 @@ internal sealed class RepositoryIntelligenceService(
                      .Order(StringComparer.OrdinalIgnoreCase))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var fullPath = Path.GetFullPath(Path.Combine(repositoryRoot, file.Replace('/', Path.DirectorySeparatorChar)));
-            if (!File.Exists(fullPath))
+            var parsed = await sources.TryGetAsync(file, cancellationToken);
+            if (parsed is not { } entry)
             {
                 continue;
             }
 
-            var source = await File.ReadAllTextAsync(fullPath, cancellationToken);
-            var root = await CSharpSyntaxTree.ParseText(source, path: fullPath)
-                .GetRootAsync(cancellationToken);
-            var fileSymbols = graph.Symbols.Symbols
-                .Where(symbol => symbol.File.Equals(file, StringComparison.OrdinalIgnoreCase))
-                .ToArray();
+            var root = entry.Root;
+            var fileSymbols = symbolsByFile[file].ToArray();
             var typeSymbolsByLine = fileSymbols
                 .Where(symbol => symbol.Kind is "class" or "record" or "struct" or "interface" or "enum")
                 .ToDictionary(symbol => symbol.Line);
@@ -972,6 +1003,63 @@ internal sealed class RepositoryIntelligenceService(
         }
 
         return ProjectOwnershipResolver.NormalizePath(relative);
+    }
+
+    private static void Track(
+        Dictionary<string, HashSet<string>> byFile,
+        string file,
+        string identity)
+    {
+        if (!byFile.TryGetValue(file, out var identities))
+        {
+            identities = new HashSet<string>(StringComparer.Ordinal);
+            byFile[file] = identities;
+        }
+
+        identities.Add(identity);
+    }
+
+    /// <summary>
+    /// Reads and parses each scoped source file at most once.
+    ///
+    /// The hotspot pass and the code-metrics pass walk the same set of files and each read and
+    /// parsed every one of them, so a whole-repository context paid for two full reads and two full
+    /// Roslyn parses of the same text. Both passes are sequential, so a plain dictionary is enough.
+    ///
+    /// Note that these trees are still parsed separately from the ones <see cref="SymbolIndexer"/>
+    /// built, and with default parse options rather than the project's, so metrics are computed over
+    /// a differently-preprocessed tree than the symbol index. Sharing those would mean the graph
+    /// retaining its syntax trees, which is a much larger change than this one.
+    /// </summary>
+    private sealed class ScopedSourceCache(string repositoryRoot)
+    {
+        private readonly Dictionary<string, (string Source, SyntaxNode Root)?> byFile =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        public async Task<(string Source, SyntaxNode Root)?> TryGetAsync(
+            string file,
+            CancellationToken cancellationToken)
+        {
+            if (byFile.TryGetValue(file, out var cached))
+            {
+                return cached;
+            }
+
+            var fullPath = Path.GetFullPath(
+                Path.Combine(repositoryRoot, file.Replace('/', Path.DirectorySeparatorChar)));
+            if (!File.Exists(fullPath))
+            {
+                byFile[file] = null;
+                return null;
+            }
+
+            var source = await File.ReadAllTextAsync(fullPath, cancellationToken);
+            var root = await CSharpSyntaxTree.ParseText(source, path: fullPath)
+                .GetRootAsync(cancellationToken);
+            var entry = (Source: source, Root: root);
+            byFile[file] = entry;
+            return entry;
+        }
     }
 
     private static string NormalizeDiagnosticPath(string repositoryRoot, string path) =>

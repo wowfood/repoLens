@@ -371,13 +371,35 @@ internal sealed partial class EvidenceQueryService(
     {
         var weights = rankingWeights ?? EvidenceRankingWeights.Default;
         var symbolArray = symbols.ToArray();
+
+        // Tokenized once per symbol rather than once per (term, symbol) pair. The document-frequency
+        // pass alone used to re-run both regexes over a freshly joined string for every term, and the
+        // scoring loop then re-tokenized the same three fields again, so a ten-term query over a
+        // hundred thousand symbols cost millions of regex evaluations to answer questions that are
+        // set lookups.
+        var tokenized = new SymbolWords[symbolArray.Length];
+        for (var index = 0; index < symbolArray.Length; index++)
+        {
+            tokenized[index] = SymbolWords.For(symbolArray[index]);
+        }
+
         var documentFrequency = terms.ToDictionary(
             term => term,
-            term => symbolArray.Count(symbol => SearchWords(symbol).Contains(term, StringComparer.OrdinalIgnoreCase)),
+            term => tokenized.Count(words => words.All.Contains(term)),
             StringComparer.OrdinalIgnoreCase);
+
+        // Rarity depends only on the term, so it was being recomputed -- a Math.Log each time -- once
+        // per symbol for no reason.
+        var rarityByTerm = terms.ToDictionary(
+            term => term,
+            term => 1d + Math.Log(
+                1d + symbolArray.Length / (double)(1 + documentFrequency.GetValueOrDefault(term))),
+            StringComparer.OrdinalIgnoreCase);
+
         var result = new Dictionary<string, Candidate>(StringComparer.Ordinal);
-        foreach (var symbol in symbolArray)
+        for (var index = 0; index < symbolArray.Length; index++)
         {
+            var symbol = symbolArray[index];
             if (changedFiles is not null && !changedFiles.Contains(symbol.File))
             {
                 continue;
@@ -392,14 +414,11 @@ internal sealed partial class EvidenceQueryService(
                 reasons.Add("exact symbol match");
             }
 
-            var nameWords = IdentifierWords(symbol.Name);
-            var semanticWords = IdentifierWords(symbol.SemanticName ?? string.Empty);
-            var fileWords = IdentifierWords(Path.GetFileNameWithoutExtension(symbol.File));
+            var words = tokenized[index];
             foreach (var term in terms)
             {
-                var rarity = 1d + Math.Log(
-                    1d + symbolArray.Length / (double)(1 + documentFrequency.GetValueOrDefault(term)));
-                if (nameWords.Contains(term, StringComparer.OrdinalIgnoreCase))
+                var rarity = rarityByTerm[term];
+                if (words.Name.Contains(term))
                 {
                     score += (int)Math.Round(weights.SymbolNameWord * rarity);
                     reasons.Add($"symbol word matches '{term}'");
@@ -409,12 +428,12 @@ internal sealed partial class EvidenceQueryService(
                     score += (int)Math.Round(weights.SymbolNameSubstring * rarity);
                     reasons.Add($"symbol name contains '{term}'");
                 }
-                else if (semanticWords.Contains(term, StringComparer.OrdinalIgnoreCase))
+                else if (words.Semantic.Contains(term))
                 {
                     score += (int)Math.Round(weights.SemanticNameWord * rarity);
                     reasons.Add($"semantic name matches word '{term}'");
                 }
-                if (fileWords.Contains(term, StringComparer.OrdinalIgnoreCase))
+                if (words.File.Contains(term))
                 {
                     score += (int)Math.Round(weights.FileNameWord * rarity);
                     reasons.Add($"file name matches '{term}'");
@@ -1035,10 +1054,34 @@ internal sealed partial class EvidenceQueryService(
         return $"; {relationship.EvidenceFile}:{relationship.EvidenceLine}{column}{framework}";
     }
 
+    /// <summary>
+    /// A symbol's searchable words, tokenized once. <see cref="All"/> is the union of the three, which
+    /// is what document frequency counts over; splitting on spaces and tokenizing the parts gives the
+    /// same words as tokenizing the joined string, because no word can span a space.
+    /// </summary>
+    private sealed record SymbolWords(
+        HashSet<string> Name,
+        HashSet<string> Semantic,
+        HashSet<string> File,
+        HashSet<string> All)
+    {
+        public static SymbolWords For(SymbolRecord symbol)
+        {
+            var name = Words(symbol.Name);
+            var semantic = Words(symbol.SemanticName ?? string.Empty);
+            var file = Words(Path.GetFileNameWithoutExtension(symbol.File));
+            var all = new HashSet<string>(name, StringComparer.OrdinalIgnoreCase);
+            all.UnionWith(semantic);
+            all.UnionWith(file);
+            return new SymbolWords(name, semantic, file, all);
+        }
+
+        private static HashSet<string> Words(string value) =>
+            new(IdentifierWords(value), StringComparer.OrdinalIgnoreCase);
+    }
+
     private static IReadOnlyList<string> SearchWords(SymbolRecord symbol) =>
-        IdentifierWords(string.Join(' ', symbol.Name, symbol.SemanticName, Path.GetFileNameWithoutExtension(symbol.File)))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
+        SymbolWords.For(symbol).All.ToArray();
 
     private static IReadOnlyList<string> IdentifierWords(string value) => WordPattern()
         .Matches(value)

@@ -43,8 +43,8 @@
     ],
     "expectedRelationships": [],
     "minPrecision": 0.75,
-    "maxTokens": 1800,
-    "maxApproximateTokens": 1900,
+    "maxTokens": 2200,
+    "maxApproximateTokens": 2300,
     "maxResults": 8,
     "graphDepth": 1
   },
