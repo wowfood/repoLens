@@ -276,7 +276,7 @@ public sealed class ParsingTests
         }
         finally
         {
-            Directory.Delete(root, true);
+            DeleteWhenReleased(root);
         }
     }
 
@@ -297,7 +297,35 @@ public sealed class ParsingTests
         }
         finally
         {
-            Directory.Delete(root, true);
+            DeleteWhenReleased(root);
+        }
+    }
+
+    /// <summary>
+    /// Deletes a directory that was a killed process's working directory.
+    ///
+    /// Windows keeps a handle on a process's current directory until the kernel has finished tearing
+    /// the process down, which happens after Kill returns. Deleting immediately therefore races the
+    /// teardown and fails intermittently — it passed locally and failed on CI. The retry waits for
+    /// the handle to be released rather than pretending the cleanup is synchronous.
+    /// </summary>
+    private static void DeleteWhenReleased(string path)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                Directory.Delete(path, true);
+                return;
+            }
+            catch (IOException) when (attempt < 20)
+            {
+                Thread.Sleep(50);
+            }
+            catch (UnauthorizedAccessException) when (attempt < 20)
+            {
+                Thread.Sleep(50);
+            }
         }
     }
 
