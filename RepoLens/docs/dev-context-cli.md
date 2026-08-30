@@ -453,9 +453,14 @@ Readers reject schemas outside their declared compatibility window (currently v5
 semantic-compilation completeness, source end lines, and evidence bundles. Schema v5 added rich
 source type/member definitions; schema v4 introduced evaluated MSBuild item provenance and richer
 semantic type relationships.
-Arrays are sorted before persistence wherever their source order is not meaningful. Diagnostic
-identities intentionally exclude line/column numbers so unrelated line movement does not
-manufacture a new diagnostic.
+Arrays are sorted before persistence wherever their source order is not meaningful, using keys that
+do not depend on the machine: resolved references order by file name rather than by absolute path,
+because the SDK lives in a different place on each platform. Diagnostic identities intentionally
+exclude line/column numbers so unrelated line movement does not manufacture a new diagnostic.
+
+Stored artifacts under `.dev-context/` are written without indentation, since only the tool reads
+them back; indentation cost a quarter of every persisted index. `config.json` and the `.trend.json`
+beside each report stay indented, because a person opens those.
 
 The graph cache key includes the schema, SDK version, configuration, filtered repository file inventory,
 solution/project/build files, and C# source contents. The inventory invalidates ownership when

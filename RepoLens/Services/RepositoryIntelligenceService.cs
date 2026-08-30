@@ -176,7 +176,7 @@ internal sealed class RepositoryIntelligenceService(
             .Where(hotspot => hotspot.LineCoveragePercent is not null)
             .Select(hotspot => hotspot.LineCoveragePercent!.Value)
             .ToArray();
-        await JsonFile.WriteAsync(
+        await JsonFile.WriteReadableAsync(
             trendPath,
             new RepositoryTrendPoint
             {

@@ -17,7 +17,7 @@ internal sealed class ContextStore
     {
         if (shouldSave)
         {
-            await JsonFile.WriteAsync(ContextPaths.Config(repositoryRoot), config, cancellationToken);
+            await JsonFile.WriteReadableAsync(ContextPaths.Config(repositoryRoot), config, cancellationToken);
         }
     }
 

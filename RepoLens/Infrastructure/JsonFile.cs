@@ -4,9 +4,27 @@ namespace DevContext.Infrastructure;
 
 internal static class JsonFile
 {
-    public static async Task WriteAsync<T>(
+    /// <summary>Writes a stored artifact that only the tool reads back, without indentation.</summary>
+    public static Task WriteAsync<T>(
         string path,
         T value,
+        CancellationToken cancellationToken) =>
+        WriteAsync(path, value, JsonDefaults.Compact, cancellationToken);
+
+    /// <summary>
+    /// Writes a file a person is expected to open — the configuration they edit, or a metrics file
+    /// sitting beside a Markdown report — with indentation.
+    /// </summary>
+    public static Task WriteReadableAsync<T>(
+        string path,
+        T value,
+        CancellationToken cancellationToken) =>
+        WriteAsync(path, value, JsonDefaults.Options, cancellationToken);
+
+    private static async Task WriteAsync<T>(
+        string path,
+        T value,
+        JsonSerializerOptions options,
         CancellationToken cancellationToken)
     {
         var directory = Path.GetDirectoryName(path)
@@ -22,7 +40,7 @@ internal static class JsonFile
                          4096,
                          FileOptions.Asynchronous))
         {
-            await JsonSerializer.SerializeAsync(stream, value, JsonDefaults.Options, cancellationToken);
+            await JsonSerializer.SerializeAsync(stream, value, options, cancellationToken);
             await stream.WriteAsync("\n"u8.ToArray(), cancellationToken);
         }
 
