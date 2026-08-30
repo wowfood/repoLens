@@ -126,7 +126,10 @@ origin, target framework, and exact evidence span. `Sufficiency`, `ShouldAbstain
 `SufficiencyReasons` distinguish supported, partial, and missing repository evidence. `AnalysisGaps` and
 `CompilationCompleteness` make unresolved references, compiler errors, multi-target limitations,
 and generated-source omissions explicit. The rendered prompt is deterministic, ends with the task,
-and is bounded by `MaxTokens` using the documented four-characters-per-token approximation. Use
+and is bounded by `MaxTokens` using the documented four-characters-per-token approximation — with one
+deliberate exception: a bundle reduced to nothing but `AnalysisGaps` keeps one concrete gap beside the
+omission notice even if that overruns the budget, because understating what the analysis missed is the
+one trade this API will not make. Use
 the JSON form when consumers need typed provenance rather than prompt-ready Markdown.
 
 Use `ChangedOnly`, `Project`, `Kinds`, and `IncludeTests` to constrain seed declarations. Graph

@@ -241,7 +241,11 @@ selection reasons, evidence relationships, a sufficient/partial/insufficient dec
 abstention flag, and known analysis gaps. JSON returns the typed `EvidenceBundle`, including content
 hashes, stable symbol identities, confidence labels, relationship origins and exact use-site spans,
 compilation completeness, and the same rendered prompt. `--max-tokens` uses the conservative
-`ceil(characters / 4)` estimate and has a minimum of 256. `--graph-depth` accepts zero through
+`ceil(characters / 4)` estimate and has a minimum of 256. Evidence is always what gets cut to make
+room: blocks are dropped, then the last one is truncated, then it is dropped too, and only then are
+analysis gaps trimmed. One concrete gap always survives beside the notice that others were omitted,
+so a bundle carrying nothing but disclosures may exceed the budget by that gap — a result may
+understate the evidence found, never the analysis missed. `--graph-depth` accepts zero through
 three; shallower queries use fewer graph-expanded results. Normal queries are stateless and do not
 require or create a baseline; changed-only selection reads but never replaces the baseline.
 

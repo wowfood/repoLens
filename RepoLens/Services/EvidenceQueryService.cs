@@ -15,6 +15,9 @@ internal sealed partial class EvidenceQueryService(
     private const int ReservedPromptTokens = 550;
     private const int MaximumExcerptLines = 60;
 
+    private const string GapsOmittedNotice =
+        "Some analysis gaps were omitted to fit the token budget; treat this result as incomplete.";
+
     private static readonly HashSet<string> StopWords = new(StringComparer.OrdinalIgnoreCase)
     {
         "about", "after", "before", "could", "does", "from", "have", "into", "that", "the",
@@ -296,11 +299,23 @@ internal sealed partial class EvidenceQueryService(
                 decision);
         }
 
-        while (EstimateTokens(prompt) > options.MaxTokens && gaps.Count > 1)
+        // Last resort, and only once there is no evidence left to give up. The notice takes the slot
+        // of the first gap it displaces rather than overwriting a surviving one, so at least one
+        // concrete disclosure always reaches the caller alongside the fact that others were lost.
+        // "Two projects failed to compile" is actionable; "some gaps were omitted" is not.
+        var gapsOmitted = false;
+        while (EstimateTokens(prompt) > options.MaxTokens && gaps.Count > (gapsOmitted ? 2 : 1))
         {
-            gaps.RemoveAt(gaps.Count - 1);
-            gaps[^1] = "Some analysis gaps were omitted to fit the token budget; "
-                       + "treat this result as incomplete.";
+            if (gapsOmitted)
+            {
+                gaps.RemoveAt(gaps.Count - 2);
+            }
+            else
+            {
+                gaps[^1] = GapsOmittedNotice;
+                gapsOmitted = true;
+            }
+
             truncated = true;
             decision = EvaluateSufficiency(blocks, relationships, completeness, gaps, truncated);
             bundleId = CreateBundleId(
