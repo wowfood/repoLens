@@ -97,6 +97,34 @@ than corpus bookkeeping:
 - a plausible out-of-scope question does not abstain on a repository this size — the lexical
   fallback finds spurious matches and the result is reported as `Partial` rather than `Insufficient`.
 
+### What has been tried against these four
+
+Four ranking changes have now been implemented, measured against both corpora, and backed out. They
+are recorded because a negative result the benchmark paid for is worth as much as a positive one, and
+because retrying them blind is the failure mode this corpus exists to prevent.
+
+- **Stemming, folded into the term list.** Regressed three solid cases to move one advisory case from
+  0% to 50% recall. Expanding terms with their stems inflates document frequency, which flattens the
+  `1 + log(N / (1 + df))` rarity weighting every other tier is scaled by.
+- **Stemming as a low-weight fallback tier.** Safe, and moved nothing.
+- **Document-level term coverage.** Each file scored by the rarity-weighted share of query terms its
+  declarations mention anywhere, boosting every candidate in that file. At a boost of 200 nothing
+  moved; at 500 and 1000 it regressed solid cases and still left all three advisory cases at 0%.
+- **Per-file diversity in selection.** Capping how many blocks one file may contribute, so a file
+  whose *name* matches a query term cannot take every result slot. Left the self corpus unchanged and
+  made the fixture corpus worse: precision 60.5% -> 57.9%, tokens 5,112 -> 5,779, with two cases
+  exceeding their ceilings, because forcing diversity pulls in weaker and larger blocks.
+
+**Why none of them work.** The evidence is not there to be reranked. `RepoLens/Cli/CliArguments.cs`
+is the expected answer to "parsing command line flags"; it contains the string `parse` ten times and
+the words "command line" and "flag" zero times. The ranker matches declaration names, semantic names
+and file names, and none of those carry the vocabulary the question uses. No weight, no aggregation
+and no diversity rule can retrieve a file on evidence the index does not hold.
+
+Closing these means widening the match surface -- XML doc comments, string literals, directory
+segments -- which is a new index field and a schema change rather than a ranking change. That is the
+open work, and it should be attempted only with these four measurements in hand.
+
 ## Cross-platform determinism
 
 The CI matrix builds on Windows, Linux, and macOS. `scripts/dump-normalized-index.ps1` emits one
