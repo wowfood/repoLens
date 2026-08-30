@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -57,6 +58,23 @@ internal sealed class RepositoryGraphService
     /// </summary>
     private readonly SemaphoreSlim buildGate = new(1, 1);
 
+    /// <summary>
+    /// Content hashes keyed by size and modification time, so a warm call re-reads only what
+    /// changed instead of the whole repository. Shared by the repository input hash and both
+    /// per-project evaluation hash passes, which is also what stops the same project files being
+    /// streamed three times in one build.
+    /// </summary>
+    private readonly FileFingerprintCache fingerprints = new();
+
+    /// <summary>
+    /// The SDK version for this process. Reading it costs a process spawn -- about 140 ms, a fifth of
+    /// a warm call -- and it is asked for on every single build. Memoized per repository root because
+    /// a <c>global.json</c> can pin a different SDK per directory; an SDK installed or removed while
+    /// this process is running is not picked up until it restarts, which is the deliberate trade.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, Task<string>> sdkVersions =
+        new(StringComparer.OrdinalIgnoreCase);
+
     private MemoizedGraph? memoized;
 
     public RepositoryGraphService(
@@ -74,6 +92,11 @@ internal sealed class RepositoryGraphService
         DevContextConfig config,
         CancellationToken cancellationToken)
     {
+        if (config.Cache.Enabled)
+        {
+            await fingerprints.LoadAsync(repositoryRoot, cancellationToken);
+        }
+
         var inventory = await fileFilter.GetFilesAsync(repositoryRoot, config.Indexing, cancellationToken);
         var sdkVersion = await ReadSdkVersionAsync(repositoryRoot, cancellationToken);
         var inputHash = await ComputeInputHashAsync(
@@ -93,13 +116,19 @@ internal sealed class RepositoryGraphService
         await buildGate.WaitAsync(cancellationToken);
         try
         {
-            return await BuildUncachedAsync(
+            var graph = await BuildUncachedAsync(
                 repositoryRoot,
                 config,
                 inventory,
                 sdkVersion,
                 inputHash,
                 cancellationToken);
+            if (config.Cache.Enabled)
+            {
+                await fingerprints.SaveAsync(repositoryRoot, cancellationToken);
+            }
+
+            return graph;
         }
         finally
         {
@@ -147,6 +176,7 @@ internal sealed class RepositoryGraphService
             inventory,
             config,
             sdkVersion,
+            config.Cache.Enabled ? fingerprints : null,
             cancellationToken);
         var reusableProjectRecords = previousEntries
             .Where(entry => preliminaryEvaluationHashes.TryGetValue(entry.Key, out var hash)
@@ -172,9 +202,11 @@ internal sealed class RepositoryGraphService
             inventory,
             config,
             sdkVersion,
+            config.Cache.Enabled ? fingerprints : null,
             cancellationToken);
         var projectHashes = await ComputeProjectInputHashesAsync(
             repositoryRoot,
+            config.Cache.Enabled ? fingerprints : null,
             repository,
             config.Indexing,
             sdkVersion,
@@ -280,34 +312,53 @@ internal sealed class RepositoryGraphService
         string sdkVersion,
         CancellationToken cancellationToken)
     {
+        // Hashed in parallel and folded back in inventory order, so the result does not depend on
+        // how the work was scheduled. Streaming each file inline was both serial and unconditional:
+        // the whole repository was read before the in-memory cache could even be consulted.
+        var contentHashes = await ParallelWork.SelectAsync(
+            inventory.RelativePaths,
+            Math.Max(1, config.Indexing.MaxParallelism),
+            async (relative, token) =>
+            {
+                var path = RepositoryFileFilter.ToFullPath(repositoryRoot, relative);
+                if (!IsRepositoryInput(path))
+                {
+                    return null;
+                }
+
+                return config.Cache.Enabled
+                    ? await fingerprints.HashAsync(path, token)
+                    : await Hashing.FileAsync(path, token);
+            },
+            cancellationToken);
+
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         Append(hash, $"schema:{SchemaVersions.Current}\n");
         Append(hash, $"sdk:{sdkVersion}\n");
         Append(hash, CacheKeyConfiguration(config));
 
-        foreach (var relative in inventory.RelativePaths)
+        for (var index = 0; index < inventory.RelativePaths.Count; index++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            Append(hash, $"\nfile:{relative}\n");
-            var path = RepositoryFileFilter.ToFullPath(repositoryRoot, relative);
-            if (!IsRepositoryInput(path))
+            Append(hash, $"\nfile:{inventory.RelativePaths[index]}\n");
+            if (contentHashes[index] is { } contentHash)
             {
-                continue;
-            }
-
-            await using var stream = File.OpenRead(path);
-            var buffer = new byte[64 * 1024];
-            int bytesRead;
-            while ((bytesRead = await stream.ReadAsync(buffer, cancellationToken)) > 0)
-            {
-                hash.AppendData(buffer, 0, bytesRead);
+                Append(hash, contentHash);
             }
         }
 
         return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
     }
 
-    private async Task<string> ReadSdkVersionAsync(
+    private Task<string> ReadSdkVersionAsync(
+        string repositoryRoot,
+        CancellationToken cancellationToken) =>
+        sdkVersions.GetOrAdd(
+            repositoryRoot,
+            static (root, state) => state.Service.ProbeSdkVersionAsync(root, state.Token),
+            (Service: this, Token: cancellationToken));
+
+    private async Task<string> ProbeSdkVersionAsync(
         string repositoryRoot,
         CancellationToken cancellationToken)
     {
@@ -327,6 +378,7 @@ internal sealed class RepositoryGraphService
 
     private static async Task<IReadOnlyDictionary<string, string>> ComputeProjectInputHashesAsync(
         string repositoryRoot,
+        FileFingerprintCache? fingerprints,
         RepositoryIndex repository,
         IndexingConfig indexing,
         string sdkVersion,
@@ -377,6 +429,7 @@ internal sealed class RepositoryGraphService
         RepositoryFileInventory inventory,
         DevContextConfig config,
         string sdkVersion,
+        FileFingerprintCache? fingerprints,
         CancellationToken cancellationToken)
     {
         var projectDirectories = projectPaths
@@ -440,6 +493,27 @@ internal sealed class RepositoryGraphService
             },
             cancellationToken);
         return results.ToDictionary(result => result.Path, result => result.Hash, StringComparer.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Folds a file's content into a hash, through the fingerprint cache when one is available. The
+    /// cache turns the repeated passes over the same shared inputs -- global.json, NuGet.Config,
+    /// Directory.Build.props and every project file, streamed once for the preliminary evaluation
+    /// hash and again after evaluation -- into a single read.
+    /// </summary>
+    private static async Task AppendContentAsync(
+        IncrementalHash hash,
+        string path,
+        FileFingerprintCache? fingerprints,
+        CancellationToken cancellationToken)
+    {
+        if (fingerprints is null)
+        {
+            await AppendFileAsync(hash, path, cancellationToken);
+            return;
+        }
+
+        Append(hash, await fingerprints.HashAsync(path, cancellationToken));
     }
 
     private static async Task<RepositoryGraph?> TryReadCacheAsync(

@@ -192,10 +192,16 @@ internal sealed class ContextStore
             }
         }
 
-        var summary = ContextPaths.Summary(repositoryRoot);
-        if (File.Exists(summary))
+        foreach (var file in new[]
+                 {
+                     ContextPaths.Summary(repositoryRoot),
+                     ContextPaths.Fingerprints(repositoryRoot)
+                 })
         {
-            File.Delete(summary);
+            if (File.Exists(file))
+            {
+                File.Delete(file);
+            }
         }
     }
 
