@@ -323,6 +323,8 @@ TestResults/
         '-c', 'user.name=dev-context smoke test',
         '-c', 'user.email=smoke-test@example.invalid',
         'commit', '--quiet', '-m', 'smoke baseline') $fixtureRoot)
+    $baseCommit = (Invoke-Checked 'git' @('rev-parse', 'HEAD') $fixtureRoot).StandardOut.Trim()
+    $baseBranch = (Invoke-Checked 'git' @('branch', '--show-current') $fixtureRoot).StandardOut.Trim()
 
     Write-Host 'Creating baseline...'
     $baseline = Invoke-DevContext @('baseline') $fixtureRoot
@@ -431,6 +433,25 @@ TestResults/
     }
     Write-Utf8File (Join-Path $OutputDirectory 'evidence-query.json') $evidenceQueryJson.StandardOut
 
+    # refs answers a structural question exactly, where query ranks by relevance. It is the command
+    # the skills tell an agent to prefer, so it belongs in the smoke path.
+    $references = Invoke-DevContext @(
+        'refs', 'Add', '--relation', 'callers', '--format', 'json') $fixtureRoot
+    if ($references.ExitCode -ne 0) {
+        throw "Reference query failed:`n$($references.StandardOut)`n$($references.StandardErr)"
+    }
+    $referenceObject = $references.StandardOut | ConvertFrom-Json -Depth 50
+    if ($referenceObject.resolvedSymbol.name -ne 'Add') {
+        throw "refs resolved '$($referenceObject.resolvedSymbol.name)'; expected 'Add'."
+    }
+    if (-not ($referenceObject.matches.source.name -contains 'Add_returns_sum')) {
+        throw 'refs did not report the test method as a caller of Add.'
+    }
+    if ($referenceObject.shouldAbstain) {
+        throw 'refs abstained on a repository whose compilation records are complete.'
+    }
+    Write-Utf8File (Join-Path $OutputDirectory 'refs.json') $references.StandardOut
+
     $regression = Invoke-DevContext @('verify') $fixtureRoot
     if ($regression.ExitCode -ne 1) {
         throw "Regression verification returned $($regression.ExitCode); expected 1.`n$($regression.StandardOut)`n$($regression.StandardErr)"
@@ -446,6 +467,55 @@ TestResults/
     if ($currentManifest.repositoryIndexCacheHit -ne $true) {
         throw 'Verification did not reuse the repository graph cache populated by affected analysis.'
     }
+
+    # Commit the regression. Everything above compared a dirty working tree against the baseline;
+    # this is the commit-aware half of the delta, which nothing in the smoke path exercised. A
+    # regression that has been committed is still a regression, and its provenance changes.
+    Write-Host 'Committing the regression to exercise the commit-aware delta...'
+    # On a feature branch, so that the ref-based review below has a real merge base to find rather
+    # than comparing a branch against itself.
+    [void](Invoke-Checked 'git' @('checkout', '--quiet', '-b', 'feature/smoke-review') $fixtureRoot)
+    [void](Invoke-Checked 'git' @('add', '--all') $fixtureRoot)
+    [void](Invoke-Checked 'git' @(
+        '-c', 'user.name=dev-context smoke test',
+        '-c', 'user.email=smoke-test@example.invalid',
+        'commit', '--quiet', '-m', 'committed regression') $fixtureRoot)
+    $committedCommit = (Invoke-Checked 'git' @('rev-parse', 'HEAD') $fixtureRoot).StandardOut.Trim()
+
+    $committedAffected = Invoke-DevContext @('affected', '--format', 'json') $fixtureRoot
+    if ($committedAffected.ExitCode -ne 0) {
+        throw "Affected analysis after commit failed:`n$($committedAffected.StandardErr)"
+    }
+    $committedAffectedObject = $committedAffected.StandardOut | ConvertFrom-Json -Depth 50
+    if (-not ($committedAffectedObject.changes.provenance -contains 'Committed')) {
+        throw 'Affected analysis did not report Committed provenance after the regression was committed.'
+    }
+    if (-not ($committedAffectedObject.changedFiles -contains 'tests/Calculator.Tests/CalculatorTests.cs')) {
+        throw 'Affected analysis lost the committed test change.'
+    }
+    Write-Utf8File (Join-Path $OutputDirectory 'affected-committed.json') $committedAffected.StandardOut
+
+    $committedVerify = Invoke-DevContext @('verify') $fixtureRoot
+    if ($committedVerify.ExitCode -ne 1) {
+        throw "Verification after commit returned $($committedVerify.ExitCode); expected 1.`n$($committedVerify.StandardOut)"
+    }
+    Assert-Contains $committedVerify.StandardOut 'Regressions: yes' 'committed verification'
+    Write-Utf8File (Join-Path $OutputDirectory 'verify-committed.txt') $committedVerify.StandardOut
+
+    # Stateless review against a git ref. It must not read or write baseline state, which is what
+    # makes it usable in CI on a pull request.
+    $review = Invoke-DevContext @('verify', '--against', $baseBranch, '--format', 'json') $fixtureRoot
+    if ($review.ExitCode -notin @(0, 1)) {
+        throw "Reference review returned $($review.ExitCode); expected 0 or 1.`n$($review.StandardErr)"
+    }
+    $reviewObject = $review.StandardOut | ConvertFrom-Json -Depth 50
+    if ($reviewObject.baseCommit -ne $baseCommit -or $reviewObject.headCommit -ne $committedCommit) {
+        throw "Reference review compared $($reviewObject.baseCommit)..$($reviewObject.headCommit); expected $baseCommit..$committedCommit."
+    }
+    if (-not ($reviewObject.changes.provenance -contains 'Committed')) {
+        throw 'Reference review did not report committed provenance.'
+    }
+    Write-Utf8File (Join-Path $OutputDirectory 'verify-against-ref.json') $review.StandardOut
 
     $compactContext = [Text.StringBuilder]::new()
     Add-TranscriptSection $compactContext 'Stored baseline status' $statusText
@@ -509,7 +579,10 @@ TestResults/
             duplicateBaselineExitCode = $duplicateBaseline.ExitCode
             affectedExitCode = $affected.ExitCode
             evidenceQueryExitCode = $evidenceQuery.ExitCode
+            referenceQueryExitCode = $references.ExitCode
             regressionVerifyExitCode = $regression.ExitCode
+            committedVerifyExitCode = $committedVerify.ExitCode
+            referenceReviewExitCode = $review.ExitCode
             restoredVerifyExitCode = $restored.ExitCode
             cleanupState = $cleanupObject.state
         }

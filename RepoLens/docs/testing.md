@@ -22,8 +22,9 @@ dotnet run --project RepoLens/RepoLens.csproj -- `
 
 This checks compilation, unit/integration tests, formatting, analyzers, API packaging, .NET tool
 packaging, and the checked-in retrieval-quality corpus. The CI workflow runs the build/test/pack,
-smoke, and corpus gates; formatting remains a local check until the existing repository is fully
-normalized.
+smoke, and corpus gates. Formatting remains a local check. `.editorconfig` pins `end_of_line = lf` so
+that `dotnet format` agrees with `.gitattributes`: without it the formatter used the platform newline
+for any line it rewrote and then reported its own output as a whitespace error on Windows.
 
 ## Isolated smoke test
 
@@ -45,8 +46,15 @@ calculator library plus MSTest project. It then verifies this sequence:
 6. the graph cache created by `affected` is reused by `verify`;
 7. restoring both files makes the full confirmation suite pass with exit code `0`;
 8. a task evidence query retrieves the production method and focused test within fixed result and
-   token bounds; and
-9. disabled cleanup reports `Skipped` without changing files.
+   token bounds;
+9. `refs --relation callers` resolves the production method exactly and reports the test method as a
+   caller without abstaining — a cross-project edge, so this also guards against the reference graph
+   losing project boundaries again;
+10. committing the regression keeps it visible, with `Committed` provenance in `affected` and a
+    still-failing `verify`, which is the commit-aware half of the delta;
+11. `verify --against <ref>` reviews a feature branch against its merge base without reading or
+    writing baseline state; and
+12. disabled cleanup reports `Skipped` without changing files.
 
 The temporary fixture is deleted after success or failure. Retain it for manual investigation with:
 
@@ -63,9 +71,10 @@ the system temporary directory before deletion.
 Each run writes an ignored directory beneath `artifacts/smoke/<timestamp>/` containing:
 
 - `baseline.txt` and `status.json`;
-- `affected.txt`;
-- `evidence-query.txt` and `evidence-query.json`;
-- `verify-regression.txt` and `verify-restored.txt`;
+- `affected.txt` and `affected-committed.json`;
+- `evidence-query.txt`, `evidence-query.json`, and `refs.json`;
+- `verify-regression.txt`, `verify-committed.txt`, `verify-restored.txt`, and
+  `verify-against-ref.json`;
 - `cleanup.json`;
 - `raw-context.txt`;
 - `compact-context.txt`;
