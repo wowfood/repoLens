@@ -258,7 +258,7 @@ public sealed class CliIntegrationTests
         }
         finally
         {
-            Directory.Delete(repository, true);
+            DeleteTemporaryDirectory(repository);
         }
     }
 
@@ -297,7 +297,7 @@ public sealed class CliIntegrationTests
         }
         finally
         {
-            Directory.Delete(repository, true);
+            DeleteTemporaryDirectory(repository);
         }
     }
 
@@ -349,7 +349,7 @@ public sealed class CliIntegrationTests
         }
         finally
         {
-            Directory.Delete(repository, true);
+            DeleteTemporaryDirectory(repository);
         }
     }
 
@@ -371,7 +371,7 @@ public sealed class CliIntegrationTests
         }
         finally
         {
-            Directory.Delete(directory, true);
+            DeleteTemporaryDirectory(directory);
         }
     }
 
@@ -405,7 +405,7 @@ public sealed class CliIntegrationTests
         }
         finally
         {
-            Directory.Delete(repository, true);
+            DeleteTemporaryDirectory(repository);
         }
     }
 
@@ -452,7 +452,7 @@ public sealed class CliIntegrationTests
         }
         finally
         {
-            Directory.Delete(repository, true);
+            DeleteTemporaryDirectory(repository);
         }
     }
 
@@ -511,7 +511,7 @@ public sealed class CliIntegrationTests
             File.SetAttributes(file, FileAttributes.Normal);
         }
 
-        Directory.Delete(path, true);
+        TempDirectory.Delete(path);
     }
 
     private sealed record ProcessResult(int ExitCode, string StandardOutput, string StandardError);

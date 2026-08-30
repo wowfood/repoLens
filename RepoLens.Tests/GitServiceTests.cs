@@ -126,7 +126,7 @@ public sealed class GitServiceTests
             File.SetAttributes(file, FileAttributes.Normal);
         }
 
-        Directory.Delete(path, true);
+        TempDirectory.Delete(path);
     }
 
     private static async Task InitializeRepositoryAsync(
