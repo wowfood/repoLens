@@ -1,0 +1,13 @@
+# Without this file `dotnet format` uses the platform's newline for any line it rewrites, which on
+# Windows means CRLF — while .gitattributes forces LF in every working copy. The two disagreed, so
+# `dotnet format --verify-no-changes` reported whitespace errors on lines it had just written itself,
+# and the only way to satisfy it was to leave line endings git would immediately normalize away.
+#
+# Deliberately minimal: this sets the line ending and nothing else, so it cannot quietly change the
+# formatting rules the existing code was written against.
+root = true
+
+[*]
+end_of_line = lf
+charset = utf-8
+insert_final_newline = true

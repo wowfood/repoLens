@@ -216,7 +216,11 @@ public sealed class ProjectIndexerTests
     {
         if (!OperatingSystem.IsWindows())
         {
-            return;
+            // Inconclusive, not a silent return. WPF evaluation needs the Windows desktop SDK, so
+            // this cannot run on the Linux and macOS legs — but returning quietly made those legs
+            // report a full pass for a test that did nothing, which is the exact failure mode this
+            // project refuses to ship in its own output.
+            Assert.Inconclusive("WPF project evaluation requires the Windows desktop SDK.");
         }
 
         var root = Path.Combine(Path.GetTempPath(), $"dev-context-wpf-{Guid.NewGuid():N}");
@@ -244,7 +248,10 @@ public sealed class ProjectIndexerTests
             if (evaluationResult is { State: ExecutionState.Failed } restrictedResult
                 && restrictedResult.StandardError.Contains("Access to the path", StringComparison.OrdinalIgnoreCase))
             {
-                return;
+                // A sandbox that denies the SDK a path it needs is an environment limitation rather
+                // than a product failure, but it is still a check that did not happen.
+                Assert.Inconclusive(
+                    $"MSBuild evaluation was denied filesystem access: {restrictedResult.StandardError}");
             }
 
             Assert.AreEqual(
