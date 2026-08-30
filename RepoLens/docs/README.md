@@ -56,7 +56,7 @@ is retained for the client process, with existing repository input hashes invali
 in-memory graph data.
 
 Release hardening now includes v1-to-v2 configuration migration, distinct evidence and benchmark
-exit codes, v5–v10 persisted-schema fixtures, and Windows/Linux/macOS CI coverage. The `trend`
+exit codes, v5–v11 persisted-schema fixtures, and Windows/Linux/macOS CI coverage. The `trend`
 command compares retained diagnostic, test, churn, and hotspot-coverage metrics; `schema` emits
 draft 2020-12 contracts without requiring a repository.
 
@@ -66,6 +66,9 @@ their provenance. `verify --against <ref>` provides stateless merge-base review 
 
 See [`testing.md`](testing.md) for the local verification matrix, isolated regression smoke test,
 and raw-versus-compact context/token comparison procedure.
+
+See [`agent-setup.md`](agent-setup.md) for connecting a coding agent: installing the CLI, the tracked
+`.mcp.json`, the MCP tools and prompts, and the abstention contract an agent has to honour.
 
 See [`evidence-benchmarks.md`](evidence-benchmarks.md) for the retrieval-recall and token-budget
 contract used to evolve task-specific evidence selection without silently degrading it.

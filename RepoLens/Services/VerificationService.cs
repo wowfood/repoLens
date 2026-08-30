@@ -81,14 +81,21 @@ internal sealed class VerificationService(
         var policyDiagnostics = newDiagnostics.Any(diagnostic =>
             diagnostic.Severity == "error"
             || config.Analysis.FailOnNewWarnings && diagnostic.Severity == "warning");
-        var executionFailed = current.Build.State == ExecutionState.Unavailable
-                              || current.Tests.State == ExecutionState.Unavailable
+        // A timed-out command counts as an execution failure wherever it appears, including for tests
+        // that produced some outcomes before the deadline. It reached no verdict, so the run cannot
+        // support "no regressions" — the whole point of reporting exit 2 rather than exit 0.
+        var executionFailed = current.Build.State is ExecutionState.Unavailable or ExecutionState.TimedOut
+                              || current.Tests.State is ExecutionState.Unavailable or ExecutionState.TimedOut
                               || current.Tests.State == ExecutionState.Failed
                               && current.Tests.Outcomes.Count == 0
                               || config.Analysis.DotnetFormat
-                              && current.Analysis.DotnetFormat.State is ExecutionState.Failed or ExecutionState.Unavailable
+                              && current.Analysis.DotnetFormat.State is ExecutionState.Failed
+                                  or ExecutionState.Unavailable
+                                  or ExecutionState.TimedOut
                               || config.Analysis.Qodana
-                              && current.Analysis.Qodana.State is ExecutionState.Failed or ExecutionState.Unavailable;
+                              && current.Analysis.Qodana.State is ExecutionState.Failed
+                                  or ExecutionState.Unavailable
+                                  or ExecutionState.TimedOut;
 
         var report = new VerificationReport
         {

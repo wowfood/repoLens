@@ -44,6 +44,7 @@ internal sealed partial class BuildService(IProcessRunner processRunner)
             Detail = result.State switch
             {
                 ExecutionState.Unavailable => "The dotnet command is unavailable.",
+                ExecutionState.TimedOut => FirstUsefulLine(result.StandardError, result.StandardOutput),
                 ExecutionState.Failed => FirstUsefulLine(result.StandardError, result.StandardOutput),
                 _ => null
             }

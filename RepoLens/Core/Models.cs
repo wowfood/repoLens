@@ -5,7 +5,10 @@ namespace DevContext.Core;
 
 public static class SchemaVersions
 {
-    public const int Current = 10;
+    // Bumped to 11 when ExecutionState gained TimedOut. The value is persisted as a string, so an
+    // artifact carrying it is unreadable by an earlier build; without the bump that would surface as
+    // an opaque JSON parse error instead of the explicit schema-window message below.
+    public const int Current = 11;
     public const int MinimumReadable = 5;
 
     public static bool IsReadable(int version) => version is >= MinimumReadable and <= Current;
@@ -36,7 +39,15 @@ public enum ExecutionState
     Succeeded,
     Failed,
     Unavailable,
-    Skipped
+    Skipped,
+
+    /// <summary>
+    /// The command exceeded its configured wall-clock ceiling and was terminated. Distinct from
+    /// <see cref="Failed"/> on purpose: a failed command produced a verdict, whereas a terminated one
+    /// produced no information at all, and reporting "no regressions" from it would be a claim the
+    /// run never earned.
+    /// </summary>
+    TimedOut
 }
 
 [JsonConverter(typeof(JsonStringEnumConverter))]
@@ -163,12 +174,46 @@ public sealed record EvidenceBenchmarkCase
     public required string Name { get; init; }
     public required string Query { get; init; }
     public required IReadOnlyList<string> ExpectedFiles { get; init; }
+
+    /// <summary>
+    /// Structural edges the bundle must contain. Two forms are accepted:
+    /// <c>"method-call"</c> requires at least one edge of that kind anywhere in the bundle, and
+    /// <c>"method-call: src/A.cs -&gt; src/B.cs"</c> requires an edge of that kind whose source and
+    /// target blocks live in those two files. The second form is what actually pins retrieval
+    /// behaviour; the first only proves the relationship extractor emitted something.
+    /// </summary>
     public IReadOnlyList<string> ExpectedRelationships { get; init; } = [];
+
+    /// <summary>
+    /// Minimum share of retrieved files that must be expected ones. Recall alone cannot fail a case
+    /// that pads the budget with irrelevant files, so a case without a precision floor is only half
+    /// a gate.
+    /// </summary>
+    public double MinPrecision { get; init; }
+
+    /// <summary>
+    /// Acceptance ceiling for the bundle's approximate token count, defaulting to
+    /// <see cref="MaxTokens"/>. The two are separate on purpose: <see cref="MaxTokens"/> is the
+    /// budget the query is given, and a bundle can never exceed the budget it was handed, so
+    /// asserting against it detects nothing. Growth is only visible against a ceiling set below the
+    /// budget, from what the case actually costs today.
+    /// </summary>
+    public int? MaxApproximateTokens { get; init; }
+
     public int MaxTokens { get; init; } = 1500;
     public int MaxResults { get; init; } = 8;
     public int GraphDepth { get; init; } = 1;
     public EvidenceSufficiency? ExpectedSufficiency { get; init; }
     public bool? ExpectAbstention { get; init; }
+
+    /// <summary>
+    /// Measures the case and reports its failures without failing the run. Reserved for behaviour
+    /// that is known to be wrong today and is queued to be fixed: encoding the wrong answer as the
+    /// expected one would make the corpus lie, and deleting the case would hide the deficiency
+    /// entirely. An advisory case states the intended answer, reports the gap on every run, and
+    /// becomes blocking by deleting this flag once the gap is closed.
+    /// </summary>
+    public bool Advisory { get; init; }
 }
 
 public sealed record EvidenceBenchmarkCaseResult
@@ -188,6 +233,19 @@ public sealed record EvidenceBenchmarkCaseResult
     public required bool ShouldAbstain { get; init; }
     public required bool SufficiencyMatched { get; init; }
     public required bool Passed { get; init; }
+
+    /// <summary>
+    /// Why the case did not meet its acceptance conditions, one entry per unmet condition. Empty
+    /// when every condition held. A gate that reports only a boolean forces whoever hit it to
+    /// re-derive the cause by hand.
+    /// </summary>
+    public IReadOnlyList<string> FailureReasons { get; init; } = [];
+
+    /// <summary>
+    /// True when this case is advisory, so <see cref="FailureReasons"/> may be non-empty while
+    /// <see cref="Passed"/> stays true. See <see cref="EvidenceBenchmarkCase.Advisory"/>.
+    /// </summary>
+    public bool Advisory { get; init; }
 }
 
 public sealed record EvidenceBenchmarkReport
@@ -198,6 +256,12 @@ public sealed record EvidenceBenchmarkReport
     public required double MeanFilePrecision { get; init; }
     public required int TotalApproximateTokens { get; init; }
     public required bool Passed { get; init; }
+
+    /// <summary>
+    /// How many advisory cases did not meet their acceptance conditions. This is the size of the
+    /// queue of known retrieval gaps; it does not affect <see cref="Passed"/>.
+    /// </summary>
+    public int AdvisoryFailures { get; init; }
 }
 
 public sealed record ApiContractInfo
@@ -293,6 +357,7 @@ public sealed record RepositoryContextReport
     public required IReadOnlyList<CodeTypeMetric> Types { get; init; }
     public required IReadOnlyList<CodeMethodMetric> Methods { get; init; }
     public required IReadOnlyList<FileHotspot> Hotspots { get; init; }
+    public IReadOnlyList<string> AnalysisGaps { get; init; } = [];
     public required string Markdown { get; init; }
     public required int ApproximateTokens { get; init; }
 }

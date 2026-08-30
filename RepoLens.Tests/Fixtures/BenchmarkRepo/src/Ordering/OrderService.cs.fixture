@@ -1,0 +1,47 @@
+using Inventory;
+
+namespace Ordering;
+
+/// <summary>
+/// Coordinates placing an order: price the lines, hold the stock, then persist. The primary
+/// constructor is deliberate — it is how the collaborators of this type are declared, and a
+/// reference graph that cannot read primary constructors cannot see any of this wiring.
+/// </summary>
+public sealed class OrderService(
+    IOrderRepository repository,
+    PricingCalculator pricing,
+    StockLedger stock)
+{
+    public async Task<Order?> PlaceOrderAsync(
+        string customerId,
+        IReadOnlyList<OrderLine> lines,
+        CancellationToken cancellationToken = default)
+    {
+        var held = new List<OrderLine>();
+        foreach (var line in lines)
+        {
+            if (!stock.Reserve(line.Sku, line.Quantity))
+            {
+                foreach (var reserved in held)
+                {
+                    stock.Release(reserved.Sku, reserved.Quantity);
+                }
+
+                return null;
+            }
+
+            held.Add(line);
+        }
+
+        var order = new Order(Guid.NewGuid().ToString("N"), customerId, lines)
+        {
+            Total = pricing.Total(lines)
+        };
+
+        await repository.SaveAsync(order, cancellationToken);
+        return order;
+    }
+
+    public Task<Order?> FindAsync(string orderId, CancellationToken cancellationToken = default) =>
+        repository.FindAsync(orderId, cancellationToken);
+}

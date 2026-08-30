@@ -41,6 +41,43 @@ public sealed class RepositoryGraphCacheTests
     }
 
     [TestMethod]
+    public async Task InputHash_IgnoresMachineDependentParallelism()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"dev-context-cache-parallelism-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        try
+        {
+            var runner = new ProcessRunner();
+            var git = await runner.RunAsync("git", ["init", "--quiet"], root, CancellationToken.None);
+            Assert.AreEqual(DevContext.Core.ExecutionState.Succeeded, git.State, git.StandardError);
+            await File.WriteAllTextAsync(Path.Combine(root, "Sample.cs"), "public class First;");
+
+            var service = new RepositoryGraphService(runner, new ProjectIndexer(runner));
+            var config = new DevContextConfig();
+            var fewer = config with { Indexing = config.Indexing with { MaxParallelism = 1 } };
+            var more = config with { Indexing = config.Indexing with { MaxParallelism = 16 } };
+
+            // MaxParallelism defaults to the processor count, so hashing it would give the same
+            // repository a different cache key on every machine and no persisted cache could ever be
+            // compared or shared between them. It schedules the work; it does not change the graph.
+            Assert.AreEqual(
+                await service.ComputeInputHashAsync(root, fewer, CancellationToken.None),
+                await service.ComputeInputHashAsync(root, more, CancellationToken.None));
+
+            var differentSetting = config with
+            {
+                Indexing = config.Indexing with { ExecuteSourceGenerators = !config.Indexing.ExecuteSourceGenerators }
+            };
+            Assert.AreNotEqual(
+                await service.ComputeInputHashAsync(root, config, CancellationToken.None),
+                await service.ComputeInputHashAsync(root, differentSetting, CancellationToken.None));
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+    [TestMethod]
     public async Task Cache_HitsForIdenticalInputsAndInvalidatesForSourceChanges()
     {
         var root = Path.Combine(Path.GetTempPath(), $"dev-context-cache-{Guid.NewGuid():N}");
@@ -174,6 +211,111 @@ public sealed class RepositoryGraphCacheTests
                 DevContext.Core.AnalysisCompletenessState.Partial,
                 removedDependency.Symbols.CompilationCompleteness.Single(record =>
                     record.Project.EndsWith("App/App.csproj", StringComparison.Ordinal)).State);
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    [TestMethod]
+    public async Task ConcurrentBuilds_EvaluateTheRepositoryOnceAndAgreeOnOneGraph()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"dev-context-single-flight-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        try
+        {
+            await WriteProjectAsync(root, "Core", [],
+                "namespace Sample; public sealed class CoreService { public void Run() { } }");
+            await WriteProjectAsync(root, "App", ["Core"],
+                "namespace Sample; public sealed class AppService { public void Execute() { new CoreService().Run(); } }");
+
+            var runner = new CountingProcessRunner(new ProcessRunner());
+            var service = new RepositoryGraphService(runner, new ProjectIndexer(runner));
+            var config = new DevContextConfig
+            {
+                Cache = new CacheConfig { Enabled = true },
+                Indexing = new IndexingConfig { ExecuteSourceGenerators = false, MaxParallelism = 2 }
+            };
+
+            // Four callers arriving together on a cold cache. Without single-flight each one runs a
+            // full MSBuild evaluation and Roslyn compilation of the whole repository, which is the
+            // most expensive thing this process does.
+            var graphs = await Task.WhenAll(Enumerable.Range(0, 4)
+                .Select(_ => service.BuildAsync(root, config, CancellationToken.None)));
+            var evaluationCalls = runner.TakeMsBuildCallCount();
+
+            var sequential = await service.BuildAsync(root, config, CancellationToken.None);
+            var sequentialEvaluationCalls = runner.TakeMsBuildCallCount();
+
+            Assert.AreEqual(1, graphs.Select(graph => graph.InputHash).Distinct(StringComparer.Ordinal).Count());
+            Assert.AreEqual(
+                1,
+                graphs.Count(graph => !graph.CacheHit),
+                "Exactly one caller should have built the graph; the rest should have observed it.");
+            Assert.AreEqual(0, sequentialEvaluationCalls, "A warm build must not evaluate anything.");
+            Assert.IsGreaterThan(0, evaluationCalls);
+            Assert.IsTrue(sequential.CacheHit);
+
+            // Two projects, so a single cold evaluation pass is two calls. Anything approaching four
+            // times that means the callers duplicated each other's work.
+            Assert.IsLessThanOrEqualTo(
+                4,
+                evaluationCalls,
+                $"Concurrent cold builds duplicated MSBuild evaluation ({evaluationCalls} calls).");
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    [TestMethod]
+    public async Task CacheSwap_HeldByAnotherProcess_StillReturnsTheGraph()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"dev-context-cache-lock-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        Directory.CreateDirectory(DevContext.Infrastructure.ContextPaths.Root(root));
+        await File.WriteAllTextAsync(
+            Path.Combine(root, "Sample.csproj"),
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>");
+        await File.WriteAllTextAsync(
+            Path.Combine(root, "Sample.cs"),
+            "namespace Sample; public class First { }");
+
+        try
+        {
+            var runner = new ProcessRunner();
+            var service = new RepositoryGraphService(runner, new ProjectIndexer(runner));
+            var config = new DevContextConfig { Cache = new CacheConfig { Enabled = true } };
+
+            // Stands in for a second dev-context process publishing its own cache at the same
+            // moment. Released before cleanup so the lock file does not block deleting the fixture.
+            using (new FileStream(
+                       DevContext.Infrastructure.ContextPaths.CacheLock(root),
+                       FileMode.OpenOrCreate,
+                       FileAccess.ReadWrite,
+                       FileShare.None))
+            {
+                // The cache is an optimization. Losing the race to write it must never fail the
+                // command that produced the graph, which is what the unguarded delete-then-rename
+                // used to do.
+                var graph = await service.BuildAsync(root, config, CancellationToken.None);
+
+                Assert.IsFalse(graph.CacheHit);
+                Assert.IsTrue(graph.Symbols.Symbols.Any(symbol => symbol.Name == "First"));
+                Assert.IsEmpty(
+                    Directory.GetDirectories(
+                        DevContext.Infrastructure.ContextPaths.Root(root),
+                        ".cache-*"),
+                    "A skipped swap must not leave its staging directory behind.");
+            }
+
+            // With the contended lock gone the next build publishes normally, proving the skip was a
+            // deferral rather than the cache being permanently abandoned.
+            service.ClearMemoryCache();
+            await service.BuildAsync(root, config, CancellationToken.None);
+            Assert.IsTrue(Directory.Exists(DevContext.Infrastructure.ContextPaths.Cache(root)));
         }
         finally
         {

@@ -1,0 +1,16 @@
+namespace Ordering;
+
+/// <summary>In-memory implementation of <see cref="IOrderRepository"/>.</summary>
+public sealed class OrderRepository : IOrderRepository
+{
+    private readonly Dictionary<string, Order> stored = new(StringComparer.Ordinal);
+
+    public Task SaveAsync(Order order, CancellationToken cancellationToken = default)
+    {
+        stored[order.OrderId] = order;
+        return Task.CompletedTask;
+    }
+
+    public Task<Order?> FindAsync(string orderId, CancellationToken cancellationToken = default) =>
+        Task.FromResult(stored.TryGetValue(orderId, out var order) ? order : null);
+}

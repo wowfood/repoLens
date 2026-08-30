@@ -10,6 +10,24 @@ namespace DevContext;
 /// <summary>
 /// In-process access to the deterministic engine used by the dev-context CLI.
 /// </summary>
+/// <remarks>
+/// <para>
+/// Threading contract. One instance is intended to serve one repository, and the MCP server
+/// registers it as a singleton, so the read-only query surface has to tolerate overlapping calls.
+/// It does: <see cref="QueryAsync"/>, <see cref="QueryReferencesAsync"/>, <see cref="ExplainAsync"/>,
+/// <see cref="ContextAsync"/>, <see cref="StatusAsync"/>, and <see cref="AffectedAsync"/> may be
+/// called concurrently. Graph construction behind them is single-flighted, so overlapping callers
+/// share one build instead of each running a full MSBuild evaluation and Roslyn compilation.
+/// </para>
+/// <para>
+/// The state-mutating commands — <see cref="InitializeAsync"/>, <see cref="CaptureAsync"/>,
+/// <see cref="BaselineAsync"/>, <see cref="VerifyAsync"/>, <see cref="CleanAsync"/>,
+/// <see cref="SaveReportAsync"/>, and <see cref="Reset"/> — are not synchronized against each other
+/// or against the query surface. Each writes files under <c>.dev-context/</c>, and running two of
+/// them at once on the same repository can interleave those writes. Callers that can issue them
+/// concurrently must serialize them.
+/// </para>
+/// </remarks>
 public sealed class DevContextApi
 {
     private readonly EngineServices _services;
@@ -85,7 +103,7 @@ public sealed class DevContextApi
             resolvedConfiguration,
             isNewConfiguration,
             configurationRequiresSave,
-            CreateServices());
+            CreateServices(resolvedConfiguration));
     }
 
     public async Task<RepositoryAnalysisSnapshot> CaptureAsync(
@@ -630,9 +648,10 @@ public sealed class DevContextApi
         _services.Graph.ClearMemoryCache();
     }
 
-    private static EngineServices CreateServices()
+    private static EngineServices CreateServices(DevContextConfig configuration)
     {
-        IProcessRunner runner = new ProcessRunner();
+        IProcessRunner runner = new ProcessRunner(
+            TimeSpan.FromSeconds(configuration.Execution.ProcessTimeoutSeconds));
         var git = new GitService(runner);
         var files = new RepositoryFileFilter(runner);
         var projects = new ProjectIndexer(runner, files);
@@ -658,7 +677,7 @@ public sealed class DevContextApi
             new RepositoryIntelligenceService(runner, git, graph, store),
             evidence,
             references,
-            new EvidenceBenchmarkService(evidence));
+            new EvidenceBenchmarkService(evidence, graph));
     }
 
     private async Task CheckOptionalProviderAsync(

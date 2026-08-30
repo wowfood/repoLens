@@ -63,3 +63,8 @@ __pycache__/
 riderModule.iml
 /_ReSharper.Caches/
 .idea/
+
+# Local AI coding-assistant config (per-machine, not repo policy)
+.claude/
+.codex/
+.junie/

@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 11,
+  "baselineId": "schema-v11-fixture",
+  "createdAtUtc": "2026-01-01T00:00:00+00:00",
+  "repositoryRoot": "/fixture",
+  "branch": "main",
+  "headCommit": "6666666666666666666666666666666666666666",
+  "capturedHeadCommit": null,
+  "diffBaseReference": null,
+  "workingTreeDirty": false,
+  "sdkVersion": "10.0.200",
+  "timings": [],
+  "repositoryInputHash": "fixture-hash-v11",
+  "repositoryIndexCacheHit": false
+}

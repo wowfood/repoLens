@@ -21,8 +21,16 @@ internal sealed record ProcessResult(
     long DurationMilliseconds,
     string Command);
 
-internal sealed class ProcessRunner : IProcessRunner
+internal sealed class ProcessRunner(TimeSpan? timeout = null) : IProcessRunner
 {
+    /// <summary>
+    /// Matches <see cref="DevContext.Configuration.ExecutionConfig.ProcessTimeoutSeconds"/>, and
+    /// applies to callers that construct a runner without configuration — chiefly tests.
+    /// </summary>
+    public static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(900);
+
+    private readonly TimeSpan timeout = timeout ?? DefaultTimeout;
+
     public async Task<ProcessResult> RunAsync(
         string executable,
         IReadOnlyList<string> arguments,
@@ -67,25 +75,37 @@ internal sealed class ProcessRunner : IProcessRunner
                 command);
         }
 
-        var standardOutput = process.StandardOutput.ReadToEndAsync(cancellationToken);
-        var standardError = process.StandardError.ReadToEndAsync(cancellationToken);
+        // Deliberately not given a cancellation token: killing the process closes its streams, so
+        // these complete on their own, and a cancelled read would discard output already produced by
+        // a run that timed out — which is the output most worth reporting.
+        var standardOutput = process.StandardOutput.ReadToEndAsync(CancellationToken.None);
+        var standardError = process.StandardError.ReadToEndAsync(CancellationToken.None);
 
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadline.CancelAfter(timeout);
         try
         {
-            await process.WaitForExitAsync(cancellationToken);
+            await process.WaitForExitAsync(deadline.Token);
         }
         catch (OperationCanceledException)
         {
-            try
-            {
-                process.Kill(true);
-            }
-            catch (InvalidOperationException)
-            {
-                // The process exited between cancellation and the kill request.
-            }
+            Terminate(process);
 
-            throw;
+            // The caller asking to stop is not the same event as the command overrunning: the first
+            // is the user's decision and propagates, the second is a result the run has to report.
+            cancellationToken.ThrowIfCancellationRequested();
+
+            stopwatch.Stop();
+            var timedOutError = await DrainAsync(standardError);
+            return new ProcessResult(
+                ExecutionState.TimedOut,
+                null,
+                await DrainAsync(standardOutput),
+                string.IsNullOrWhiteSpace(timedOutError)
+                    ? TimeoutDetail(timeout)
+                    : $"{timedOutError.TrimEnd()}{Environment.NewLine}{TimeoutDetail(timeout)}",
+                stopwatch.ElapsedMilliseconds,
+                command);
         }
 
         stopwatch.Stop();
@@ -97,6 +117,38 @@ internal sealed class ProcessRunner : IProcessRunner
             stopwatch.ElapsedMilliseconds,
             command);
     }
+
+    private static void Terminate(Process process)
+    {
+        try
+        {
+            process.Kill(true);
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or NotSupportedException)
+        {
+            // The process exited between the deadline firing and the kill request.
+        }
+    }
+
+    /// <summary>
+    /// Reads whatever a stream produced before its process was killed. The wait is bounded because a
+    /// timeout handler that can itself hang would defeat the purpose of having a timeout.
+    /// </summary>
+    private static async Task<string> DrainAsync(Task<string> read)
+    {
+        try
+        {
+            return await read.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        catch (Exception exception) when (exception is TimeoutException or IOException or OperationCanceledException)
+        {
+            return string.Empty;
+        }
+    }
+
+    private static string TimeoutDetail(TimeSpan timeout) =>
+        $"The command exceeded its {timeout.TotalSeconds:N0}s timeout and was terminated. "
+        + "Raise execution.processTimeoutSeconds if this command is legitimately slower.";
 
     private static string FormatCommand(string executable, IEnumerable<string> arguments) =>
         string.Join(' ', new[] { executable }.Concat(arguments).Select(Quote));

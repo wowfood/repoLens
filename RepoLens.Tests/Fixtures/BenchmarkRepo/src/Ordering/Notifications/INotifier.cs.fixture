@@ -1,0 +1,7 @@
+namespace Ordering.Notifications;
+
+/// <summary>Distractor cluster: plausible, adjacent to ordering, unrelated to stock or pricing.</summary>
+public interface INotifier
+{
+    Task NotifyAsync(string customerId, string message, CancellationToken cancellationToken = default);
+}

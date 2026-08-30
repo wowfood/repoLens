@@ -34,6 +34,106 @@ internal static class SymbolIndexer
     private static readonly SymbolDisplayFormat ShortNameFormat =
         SymbolDisplayFormat.MinimallyQualifiedFormat;
 
+    /// <summary>
+    /// Resolves a referenced <see cref="ISymbol"/> back to the declaration RepoLens indexed for it,
+    /// across compilation boundaries.
+    ///
+    /// Each project is compiled separately and sees its project references through
+    /// <see cref="Compilation.ToMetadataReference()"/>. A symbol reached that way is a different
+    /// <see cref="ISymbol"/> instance from the one the declaring project's own compilation produced,
+    /// and <see cref="SymbolEqualityComparer.Default"/> does not equate the two. Looking targets up
+    /// by symbol identity alone therefore silently dropped every reference that crossed a project
+    /// boundary — which, for a library, is every caller it has.
+    ///
+    /// The fallback key is the containing assembly name plus the normalized symbol's display string.
+    /// Both halves are evaluated identically on either side of the boundary, so the declaring and the
+    /// referencing compilation agree on it.
+    /// </summary>
+    internal sealed class DeclaredSymbolLookup
+    {
+        private readonly IReadOnlyDictionary<ISymbol, SymbolRecord> bySymbol;
+        private readonly IReadOnlyDictionary<string, SymbolRecord> byAssemblyQualifiedName;
+        private readonly IReadOnlySet<string> indexedAssemblies;
+
+        private DeclaredSymbolLookup(
+            IReadOnlyDictionary<ISymbol, SymbolRecord> bySymbol,
+            IReadOnlyDictionary<string, SymbolRecord> byAssemblyQualifiedName,
+            IReadOnlySet<string> indexedAssemblies)
+        {
+            this.bySymbol = bySymbol;
+            this.byAssemblyQualifiedName = byAssemblyQualifiedName;
+            this.indexedAssemblies = indexedAssemblies;
+        }
+
+        public static DeclaredSymbolLookup Empty { get; } = new(
+            new Dictionary<ISymbol, SymbolRecord>(SymbolEqualityComparer.Default),
+            new Dictionary<string, SymbolRecord>(StringComparer.Ordinal),
+            new HashSet<string>(StringComparer.Ordinal));
+
+        /// <param name="declarations">
+        /// Keyed by the already-normalized declared symbol, in a deterministic order: where two
+        /// projects declare the same assembly-qualified name — shared-source projects do this — the
+        /// first wins, and the ordering of the input decides which that is.
+        /// </param>
+        public static DeclaredSymbolLookup Create(IEnumerable<IReadOnlyDictionary<ISymbol, SymbolRecord>> declarations)
+        {
+            var bySymbol = new Dictionary<ISymbol, SymbolRecord>(SymbolEqualityComparer.Default);
+            var byName = new Dictionary<string, SymbolRecord>(StringComparer.Ordinal);
+            var assemblies = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var declaration in declarations)
+            {
+                foreach (var (symbol, record) in declaration)
+                {
+                    bySymbol.TryAdd(symbol, record);
+                    var assembly = symbol.ContainingAssembly?.Name;
+                    if (string.IsNullOrEmpty(assembly))
+                    {
+                        continue;
+                    }
+
+                    assemblies.Add(assembly);
+                    byName.TryAdd(AssemblyQualifiedName(assembly, symbol), record);
+                }
+            }
+
+            return new DeclaredSymbolLookup(bySymbol, byName, assemblies);
+        }
+
+        /// <summary>
+        /// Every declaration RepoLens indexed, paired with the symbol that declared it. Used to walk
+        /// declarations looking for the relationships that are only visible from the declaring side,
+        /// such as overrides and explicit interface implementations.
+        /// </summary>
+        public IEnumerable<KeyValuePair<ISymbol, SymbolRecord>> Declarations => bySymbol;
+
+        public bool TryResolve(ISymbol symbol, out SymbolRecord record)
+        {
+            var normalized = NormalizeSymbol(symbol);
+            if (bySymbol.TryGetValue(normalized, out var direct))
+            {
+                record = direct;
+                return true;
+            }
+
+            // Gated on the assembly set before the display string is rendered: the overwhelming
+            // majority of unresolved targets are BCL and package symbols, and rendering a display
+            // string for each of those would cost more than the edges are worth.
+            var assembly = normalized.ContainingAssembly?.Name;
+            if (assembly is null || !indexedAssemblies.Contains(assembly))
+            {
+                record = null!;
+                return false;
+            }
+
+            return byAssemblyQualifiedName.TryGetValue(
+                AssemblyQualifiedName(assembly, normalized),
+                out record!);
+        }
+
+        private static string AssemblyQualifiedName(string assembly, ISymbol symbol) =>
+            string.Concat(assembly, "|", symbol.ToDisplayString(SymbolDisplayFormat.CSharpErrorMessageFormat));
+    }
+
     public static async Task<(SymbolIndex Symbols, DependencyIndex Dependencies)> BuildAsync(
         string repositoryRoot,
         RepositoryIndex projects,
@@ -99,14 +199,11 @@ internal static class SymbolIndexer
                 token),
             cancellationToken);
         var symbols = declarationIndexes.SelectMany(index => index.Symbols).ToList();
-        var declaredSymbols = new Dictionary<ISymbol, SymbolRecord>(SymbolEqualityComparer.Default);
-        foreach (var declarationIndex in declarationIndexes)
-        {
-            foreach (var (symbol, record) in declarationIndex.DeclaredSymbols)
-            {
-                declaredSymbols.TryAdd(symbol, record);
-            }
-        }
+
+        // analysisProjects is ordered by path, and ParallelWork.SelectAsync preserves input order,
+        // so the "first declaration wins" tie-break inside the lookup is stable across runs.
+        var declaredSymbols = DeclaredSymbolLookup.Create(
+            declarationIndexes.Select(index => index.DeclaredSymbols));
 
         IReadOnlyList<SymbolReference> references = await IndexReferencesAsync(
             repositoryRoot,
@@ -418,6 +515,7 @@ internal static class SymbolIndexer
                     repositoryRoot,
                     project,
                     framework,
+                    FrameworksOf(project)[0],
                     TargetAnalysis(project, framework),
                     allCompilations[key],
                     syntaxTrees[project.Path].Count(tree =>
@@ -479,6 +577,7 @@ internal static class SymbolIndexer
         string repositoryRoot,
         ProjectRecord project,
         string framework,
+        string indexedFramework,
         TargetFrameworkAnalysisRecord analysis,
         CSharpCompilation compilation,
         int loadedSourceFiles,
@@ -489,6 +588,13 @@ internal static class SymbolIndexer
             .Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error)
             .ToArray();
         var gaps = new List<string>();
+        if (!framework.Equals(indexedFramework, StringComparison.OrdinalIgnoreCase))
+        {
+            gaps.Add(
+                $"Declarations and relationships were indexed from target framework '{indexedFramework}' only; "
+                + $"symbols that exist solely under '{framework}' are absent from the graph.");
+        }
+
         if (analysis.ReferenceResolutionState != ExecutionState.Succeeded)
         {
             gaps.Add(analysis.ReferenceResolutionDetail is null
@@ -1009,7 +1115,7 @@ internal static class SymbolIndexer
         string repositoryRoot,
         RepositoryIndex projects,
         IReadOnlyDictionary<string, CSharpCompilation> compilations,
-        IReadOnlyDictionary<ISymbol, SymbolRecord> declaredSymbols,
+        DeclaredSymbolLookup declaredSymbols,
         int maxParallelism,
         CancellationToken cancellationToken)
     {
@@ -1036,7 +1142,7 @@ internal static class SymbolIndexer
     private static async Task<IReadOnlyList<SymbolReference>> IndexProjectReferencesAsync(
         ProjectRecord project,
         IReadOnlyDictionary<string, CSharpCompilation> compilations,
-        IReadOnlyDictionary<ISymbol, SymbolRecord> declaredSymbols,
+        DeclaredSymbolLookup declaredSymbols,
         CancellationToken cancellationToken)
     {
         var references = new HashSet<SymbolReference>();
@@ -1078,7 +1184,7 @@ internal static class SymbolIndexer
                     targetFramework);
             }
 
-            foreach (var creation in root.DescendantNodes().OfType<ObjectCreationExpressionSyntax>())
+            foreach (var creation in root.DescendantNodes().OfType<BaseObjectCreationExpressionSyntax>())
             {
                 var source = FindContainingSymbol(creation, model, declaredSymbols);
                 var operation = model.GetOperation(creation, cancellationToken) as IObjectCreationOperation;
@@ -1241,6 +1347,27 @@ internal static class SymbolIndexer
                 }
             }
 
+            foreach (var typeDeclaration in root.DescendantNodes().OfType<TypeDeclarationSyntax>())
+            {
+                if (typeDeclaration.ParameterList is null)
+                {
+                    continue;
+                }
+
+                var primarySource = FindContainingTypeSymbol(typeDeclaration, model, declaredSymbols);
+                foreach (var parameter in typeDeclaration.ParameterList.Parameters)
+                {
+                    AddTypeReferences(
+                        primarySource,
+                        parameter.Type is null
+                            ? null
+                            : model.GetTypeInfo(parameter.Type, cancellationToken).Type,
+                        "constructor-parameter",
+                        declaredSymbols,
+                        references);
+                }
+            }
+
             foreach (var constructor in root.DescendantNodes().OfType<ConstructorDeclarationSyntax>())
             {
                 var source = FindContainingSymbol(constructor, model, declaredSymbols);
@@ -1272,7 +1399,7 @@ internal static class SymbolIndexer
     private static SymbolRecord? FindContainingSymbol(
         SyntaxNode node,
         SemanticModel model,
-        IReadOnlyDictionary<ISymbol, SymbolRecord> declaredSymbols)
+        DeclaredSymbolLookup declaredSymbols)
     {
         foreach (var declaration in node.AncestorsAndSelf())
         {
@@ -1292,7 +1419,7 @@ internal static class SymbolIndexer
             }
 
             if (model.GetDeclaredSymbol(declaration) is { } memberSymbol
-                && declaredSymbols.TryGetValue(NormalizeSymbol(memberSymbol), out var memberRecord))
+                && declaredSymbols.TryResolve(memberSymbol, out var memberRecord))
             {
                 return memberRecord;
             }
@@ -1301,7 +1428,7 @@ internal static class SymbolIndexer
         var type = node.Ancestors().OfType<BaseTypeDeclarationSyntax>().FirstOrDefault();
         if (type is not null
             && model.GetDeclaredSymbol(type) is { } typeSymbol
-            && declaredSymbols.TryGetValue(NormalizeSymbol(typeSymbol), out var typeRecord))
+            && declaredSymbols.TryResolve(typeSymbol, out var typeRecord))
         {
             return typeRecord;
         }
@@ -1312,12 +1439,12 @@ internal static class SymbolIndexer
     private static SymbolRecord? FindContainingTypeSymbol(
         SyntaxNode node,
         SemanticModel model,
-        IReadOnlyDictionary<ISymbol, SymbolRecord> declaredSymbols)
+        DeclaredSymbolLookup declaredSymbols)
     {
         var type = node.AncestorsAndSelf().OfType<BaseTypeDeclarationSyntax>().FirstOrDefault();
         return type is not null
                && model.GetDeclaredSymbol(type) is { } typeSymbol
-               && declaredSymbols.TryGetValue(NormalizeSymbol(typeSymbol), out var typeRecord)
+               && declaredSymbols.TryResolve(typeSymbol, out var typeRecord)
             ? typeRecord
             : null;
     }
@@ -1326,7 +1453,7 @@ internal static class SymbolIndexer
         SymbolRecord? source,
         ISymbol? target,
         string relationship,
-        IReadOnlyDictionary<ISymbol, SymbolRecord> declaredSymbols,
+        DeclaredSymbolLookup declaredSymbols,
         ISet<SymbolReference> references,
         EvidenceConfidence confidence = EvidenceConfidence.SemanticResolved,
         SyntaxNode? evidence = null,
@@ -1334,7 +1461,7 @@ internal static class SymbolIndexer
         string? targetFramework = null)
     {
         if (source is null || target is null
-            || !declaredSymbols.TryGetValue(NormalizeSymbol(target), out var targetRecord)
+            || !declaredSymbols.TryResolve(target, out var targetRecord)
             || source.Identity == targetRecord.Identity)
         {
             return;
@@ -1363,7 +1490,7 @@ internal static class SymbolIndexer
         SymbolRecord? source,
         ITypeSymbol? target,
         string relationship,
-        IReadOnlyDictionary<ISymbol, SymbolRecord> declaredSymbols,
+        DeclaredSymbolLookup declaredSymbols,
         ISet<SymbolReference> references,
         EvidenceConfidence confidence = EvidenceConfidence.SemanticResolved,
         SyntaxNode? evidence = null,
@@ -1446,7 +1573,7 @@ internal static class SymbolIndexer
         IInvocationOperation? operation,
         SymbolRecord? source,
         SemanticModel model,
-        IReadOnlyDictionary<ISymbol, SymbolRecord> declaredSymbols,
+        DeclaredSymbolLookup declaredSymbols,
         ISet<SymbolReference> references,
         CancellationToken cancellationToken,
         string? targetFramework)
@@ -1500,10 +1627,10 @@ internal static class SymbolIndexer
     }
 
     private static void AddOverrideAndInterfaceReferences(
-        IReadOnlyDictionary<ISymbol, SymbolRecord> declaredSymbols,
+        DeclaredSymbolLookup declaredSymbols,
         ISet<SymbolReference> references)
     {
-        foreach (var pair in declaredSymbols)
+        foreach (var pair in declaredSymbols.Declarations)
         {
             var source = pair.Value;
             switch (pair.Key)

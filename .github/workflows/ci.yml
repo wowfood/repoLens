@@ -27,6 +27,16 @@ jobs:
             10.0.x
       - name: Restore
         run: dotnet restore RepoLens.sln
+      - name: Check for vulnerable NuGet packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          output=$(dotnet list RepoLens.sln package --vulnerable --include-transitive 2>&1)
+          echo "$output"
+          if echo "$output" | grep -q "has the following vulnerable packages"; then
+            echo "::error::Vulnerable NuGet packages detected"
+            exit 1
+          fi
       - name: Build
         run: dotnet build RepoLens.sln --configuration Release --no-restore
       - name: Test
@@ -43,6 +53,9 @@ jobs:
         run: ./scripts/run-smoke-test.ps1 -NoBuild -Configuration Release
       - name: Retrieval benchmark
         run: dotnet run --project RepoLens/RepoLens.csproj --configuration Release --no-build -- benchmark RepoLens/benchmarks/evidence-corpus.json
+      - name: Fixture retrieval benchmark
+        shell: pwsh
+        run: ./scripts/run-benchmark-fixture.ps1 -Configuration Release -NormalizedIndexPath artifacts/determinism/index.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -50,3 +63,43 @@ jobs:
           path: |
             artifacts/packages/*
             artifacts/smoke/**/summary.json
+      - name: Upload normalized index
+        uses: actions/upload-artifact@v4
+        with:
+          name: repolens-determinism-${{ matrix.os }}
+          path: artifacts/determinism/index.txt
+
+  determinism:
+    # The three-legged matrix used to build everything three times and compare nothing. This job is
+    # what turns it into a cross-platform determinism assertion.
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: repolens-determinism-*
+          path: determinism
+      - name: Compare normalized indexes across operating systems
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          legs=(determinism/*/index.txt)
+          if [ "${#legs[@]}" -lt 2 ]; then
+            echo "::error::Expected a normalized index from each matrix leg, found ${#legs[@]}."
+            exit 1
+          fi
+          reference="${legs[0]}"
+          status=0
+          for leg in "${legs[@]:1}"; do
+            if ! diff -u "$reference" "$leg" > "$leg.diff"; then
+              echo "::error::$leg differs from $reference; RepoLens produced platform-dependent output."
+              head -n 80 "$leg.diff"
+              status=1
+            fi
+          done
+          if [ "$status" -eq 0 ]; then
+            echo "All ${#legs[@]} normalized indexes are identical."
+          fi
+          exit "$status"

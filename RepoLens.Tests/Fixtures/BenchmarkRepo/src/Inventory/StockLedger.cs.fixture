@@ -1,0 +1,36 @@
+namespace Inventory;
+
+/// <summary>
+/// Tracks how many units of each item are physically held in the warehouse and sets units aside so
+/// a confirmed purchase cannot be sold twice.
+/// </summary>
+public sealed class StockLedger
+{
+    private readonly Dictionary<string, int> onHand = new(StringComparer.Ordinal);
+
+    public int OnHand(string sku) => onHand.TryGetValue(sku, out var units) ? units : 0;
+
+    public void Receive(string sku, int units)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(units);
+        onHand[sku] = OnHand(sku) + units;
+    }
+
+    /// <summary>
+    /// Holds back <paramref name="units"/> of <paramref name="sku"/> for a customer purchase.
+    /// Returns false when the warehouse cannot cover the request, which is the caller's signal to
+    /// reject the purchase rather than promise stock it does not have.
+    /// </summary>
+    public bool Reserve(string sku, int units)
+    {
+        if (units <= 0 || OnHand(sku) < units)
+        {
+            return false;
+        }
+
+        onHand[sku] = OnHand(sku) - units;
+        return true;
+    }
+
+    public void Release(string sku, int units) => Receive(sku, units);
+}

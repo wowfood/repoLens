@@ -5,8 +5,12 @@ library and NuGet package. Applications can capture repository structure and hea
 MSBuild ownership, build bounded repository contexts, or use the same immutable baseline,
 affected-code, cleanup, and verification lifecycle as the CLI.
 
+`RepoLens.Api` is not published to nuget.org yet. Build the package from this repository and add it
+from a local source:
+
 ```powershell
-dotnet add package RepoLens.Api --version 0.11.0
+dotnet pack RepoLens.Api/RepoLens.Api.csproj --configuration Release --output artifacts/packages
+dotnet add package RepoLens.Api --version 0.11.0 --source ./artifacts/packages
 ```
 
 ```csharp

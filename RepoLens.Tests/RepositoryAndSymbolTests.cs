@@ -417,6 +417,174 @@ public sealed class RepositoryAndSymbolTests
     }
 
     [TestMethod]
+    public void DeclaredSymbolLookup_ResolvesASymbolReachedThroughADifferentCompilation()
+    {
+        // Each project is compiled separately and sees its references through a metadata reference,
+        // so the ISymbol a referencing compilation hands back is a different instance from the one
+        // the declaring compilation produced. SymbolEqualityComparer.Default does not equate the two,
+        // and resolving targets by symbol identity alone therefore dropped every reference that
+        // crossed a project boundary. Two independently created compilations reproduce that
+        // inequality deterministically, without depending on when Roslyn chooses to retarget.
+        const string source = """
+            namespace Ordering;
+            public sealed class OrderService
+            {
+                public void Place(string sku) { }
+            }
+            """;
+        var declaring = CSharpCompilation.Create(
+            "Ordering",
+            [CSharpSyntaxTree.ParseText(source)],
+            [MetadataReference.CreateFromFile(typeof(object).Assembly.Location)]);
+        var referencing = CSharpCompilation.Create(
+            "Ordering",
+            [CSharpSyntaxTree.ParseText(source)],
+            [MetadataReference.CreateFromFile(typeof(object).Assembly.Location)]);
+
+        var declared = declaring.GetTypeByMetadataName("Ordering.OrderService")!;
+        var seenFromElsewhere = referencing.GetTypeByMetadataName("Ordering.OrderService")!;
+        Assert.IsFalse(
+            SymbolEqualityComparer.Default.Equals(declared, seenFromElsewhere),
+            "The two compilations must produce distinct symbols for this test to mean anything.");
+
+        var record = new SymbolRecord(
+            "identity",
+            "class",
+            "OrderService",
+            "Ordering",
+            null,
+            "src/Ordering/Ordering.csproj",
+            "src/Ordering/OrderService.cs",
+            1,
+            null,
+            [])
+        {
+            SemanticName = "Ordering.OrderService"
+        };
+        var lookup = SymbolIndexer.DeclaredSymbolLookup.Create(
+        [
+            new Dictionary<ISymbol, SymbolRecord>(SymbolEqualityComparer.Default) { [declared] = record }
+        ]);
+
+        Assert.IsTrue(lookup.TryResolve(declared, out var direct));
+        Assert.AreSame(record, direct);
+        Assert.IsTrue(
+            lookup.TryResolve(seenFromElsewhere, out var acrossCompilations),
+            "A symbol reached through a project reference must resolve to the declaring project's record.");
+        Assert.AreSame(record, acrossCompilations);
+
+        var unrelated = referencing.GetTypeByMetadataName("System.String");
+        Assert.IsFalse(
+            lookup.TryResolve(unrelated!, out _),
+            "A symbol from an assembly RepoLens did not index must not resolve to anything.");
+    }
+
+    [TestMethod]
+    public void ReferenceQuery_ScopesAbsenceProofToEveryProjectThatCouldHoldAnInboundEdge()
+    {
+        // Core -> Domain -> App: an inbound edge to a Core symbol can be declared by Domain or App,
+        // so the completeness of Core alone can never prove that no caller exists.
+        ProjectDependency[] dependencies =
+        [
+            new("src/Domain/Domain.csproj", "src/Core/Core.csproj"),
+            new("src/App/App.csproj", "src/Domain/Domain.csproj"),
+            new("src/Unrelated/Unrelated.csproj", "src/Other/Other.csproj")
+        ];
+        var symbol = new SymbolRecord(
+            "identity",
+            "method",
+            "Handle",
+            "Core",
+            "Handler",
+            "src/Core/Core.csproj",
+            "src/Core/Handler.cs",
+            10,
+            null,
+            []);
+
+        var inbound = SymbolReferenceQueryService.ReferenceScopeProjects(
+            symbol,
+            SymbolReferenceRelation.Callers,
+            dependencies);
+        CollectionAssert.AreEquivalent(
+            new[] { "src/Core/Core.csproj", "src/Domain/Domain.csproj", "src/App/App.csproj" },
+            inbound.ToArray());
+
+        // Callees are declared by the resolved symbol itself, so only its own project matters.
+        var outbound = SymbolReferenceQueryService.ReferenceScopeProjects(
+            symbol,
+            SymbolReferenceRelation.Callees,
+            dependencies);
+        CollectionAssert.AreEquivalent(new[] { "src/Core/Core.csproj" }, outbound.ToArray());
+
+        Assert.IsEmpty(SymbolReferenceQueryService.ReferenceScopeProjects(
+            null,
+            SymbolReferenceRelation.Callers,
+            dependencies));
+    }
+
+    [TestMethod]
+    public async Task SymbolIndexer_IndexesTargetTypedNewAndPrimaryConstructorParameters()
+    {
+        var root = CreateTemporaryDirectory();
+        Directory.CreateDirectory(Path.Combine(root, "src"));
+        await File.WriteAllTextAsync(
+            Path.Combine(root, "src", "App.cs"),
+            """
+            namespace Sample;
+
+            public class Dependency
+            {
+            }
+
+            // A primary constructor declares its parameters on the type, not in a
+            // ConstructorDeclarationSyntax, so this dependency used to be invisible.
+            public class Service(Dependency dependency)
+            {
+                public Dependency Dependency { get; } = dependency;
+            }
+
+            public class Factory
+            {
+                // Target-typed `new()` is an ImplicitObjectCreationExpressionSyntax, which the
+                // narrower ObjectCreationExpressionSyntax walk used to skip entirely.
+                public Dependency Create()
+                {
+                    Dependency created = new();
+                    return created;
+                }
+            }
+            """);
+        try
+        {
+            var project = Project("Sample", "src/Sample.csproj", false, [], ["src/App.cs"]);
+            var repository = new RepositoryIndex { Solution = "Sample.sln", Projects = [project] };
+
+            var (symbols, dependencies) = await SymbolIndexer.BuildAsync(root, repository, CancellationToken.None);
+            var byIdentity = symbols.Symbols.ToDictionary(symbol => symbol.Identity, StringComparer.Ordinal);
+
+            bool Edge(string relationship, string source, string target) =>
+                dependencies.Symbols.Any(reference =>
+                    reference.Relationship == relationship
+                    && byIdentity.TryGetValue(reference.SourceSymbol, out var from)
+                    && byIdentity.TryGetValue(reference.TargetSymbol, out var to)
+                    && from.Name == source
+                    && to.Name == target);
+
+            Assert.IsTrue(
+                Edge("constructor-parameter", "Service", "Dependency"),
+                "A primary constructor parameter must produce a constructor-parameter edge.");
+            Assert.IsTrue(
+                Edge("constructed-type", "Create", "Dependency"),
+                "Target-typed new() must produce a constructed-type edge.");
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    [TestMethod]
     public async Task SymbolIndexer_ReportsCompilationCompletenessPerTargetFramework()
     {
         var root = CreateTemporaryDirectory();
@@ -448,8 +616,18 @@ public sealed class RepositoryAndSymbolTests
             CollectionAssert.AreEqual(
                 new[] { "net10.0", "net8.0" },
                 symbols.CompilationCompleteness.Select(record => record.TargetFramework).ToArray());
-            Assert.IsTrue(symbols.CompilationCompleteness.All(record =>
-                record.State == AnalysisCompletenessState.Complete));
+
+            // Declarations and relationships are indexed from the first evaluated target framework
+            // only, so every other target must say so rather than claim a complete analysis.
+            var indexed = symbols.CompilationCompleteness.Single(record => record.TargetFramework == "net8.0");
+            var notIndexed = symbols.CompilationCompleteness.Single(record => record.TargetFramework == "net10.0");
+            Assert.AreEqual(AnalysisCompletenessState.Complete, indexed.State);
+            Assert.IsEmpty(indexed.Gaps);
+            Assert.AreEqual(AnalysisCompletenessState.Partial, notIndexed.State);
+            Assert.IsTrue(
+                notIndexed.Gaps.Any(gap =>
+                    gap.Contains("indexed from target framework 'net8.0' only", StringComparison.Ordinal)),
+                string.Join(" | ", notIndexed.Gaps));
         }
         finally
         {

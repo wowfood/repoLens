@@ -502,7 +502,7 @@ public sealed class ApiIntegrationTests
             File.SetAttributes(file, FileAttributes.Normal);
         }
 
-        Directory.Delete(path, true);
+        TempDirectory.Delete(path);
     }
 
     private sealed record ProcessResult(int ExitCode, string StandardOutput, string StandardError);

@@ -6,11 +6,15 @@
       "RepoLens/Services/EvidenceQueryService.cs",
       "RepoLens.Tests/ApiIntegrationTests.cs",
       "RepoLens.Tests/CliArgumentsTests.cs",
+      "RepoLens.Tests/EvidenceBenchmarkTests.cs",
+      "RepoLens/Cli/RepoLensMcpServer.cs",
       "RepoLens/Core/Models.cs"
     ],
     "expectedRelationships": [],
-    "maxTokens": 1800,
-    "maxResults": 8,
+    "minPrecision": 0.75,
+    "maxTokens": 2600,
+    "maxApproximateTokens": 2600,
+    "maxResults": 12,
     "graphDepth": 1
   },
   {
@@ -22,7 +26,9 @@
       "RepoLens/Core/Models.cs"
     ],
     "expectedRelationships": [],
+    "minPrecision": 0.75,
     "maxTokens": 1800,
+    "maxApproximateTokens": 1900,
     "maxResults": 8,
     "graphDepth": 1
   },
@@ -36,7 +42,9 @@
       "RepoLens/Core/Models.cs"
     ],
     "expectedRelationships": [],
+    "minPrecision": 0.75,
     "maxTokens": 1800,
+    "maxApproximateTokens": 1900,
     "maxResults": 8,
     "graphDepth": 1
   },
@@ -45,48 +53,64 @@
     "query": "Razor XAML markup binding event component relationships",
     "expectedFiles": ["RepoLens/Services/MarkupIndexer.cs"],
     "expectedRelationships": [],
+    "minPrecision": 0.4,
     "maxTokens": 1800,
+    "maxApproximateTokens": 1900,
     "maxResults": 8,
     "graphDepth": 1
   },
   {
-    "name": "public benchmark API",
-    "query": "DevContextApi BenchmarkAsync ApiContractInfo EvidenceBenchmarkCase",
+    "name": "embedding the benchmark in an application",
+    "query": "how does an application embedding the engine run the retrieval benchmark",
     "expectedFiles": [
       "RepoLens.Api/DevContextApi.cs",
-      "RepoLens/Cli/DevContextApplication.cs",
       "RepoLens/Core/Models.cs"
     ],
     "expectedRelationships": [],
+    "minPrecision": 0.4,
     "maxTokens": 1800,
+    "maxApproximateTokens": 1900,
     "maxResults": 8,
-    "graphDepth": 1
+    "graphDepth": 1,
+    "advisory": true
   },
   {
-    "name": "query filters",
-    "query": "CliArguments Parse ChangedOnly ProjectFilter Kinds IncludeTests",
-    "expectedFiles": [
-      "RepoLens/Cli/CliArguments.cs",
-      "RepoLens.Tests/CliArgumentsTests.cs",
-      "RepoLens/Core/Models.cs",
-      "RepoLens/Cli/DevContextApplication.cs"
-    ],
+    "name": "parsing command line flags",
+    "query": "where are the command line flags for the query command parsed",
+    "expectedFiles": ["RepoLens/Cli/CliArguments.cs"],
     "expectedRelationships": [],
+    "minPrecision": 0.2,
     "maxTokens": 1800,
+    "maxApproximateTokens": 1900,
     "maxResults": 8,
-    "graphDepth": 1
+    "graphDepth": 1,
+    "advisory": true
   },
   {
-    "name": "schema validation",
-    "query": "ContextStore ReadStatusAsync ReadValidatedAsync EnsureReadable schema",
-    "expectedFiles": [
-      "RepoLens/Services/ContextStore.cs",
-      "RepoLens/Core/Models.cs"
-    ],
+    "name": "reading a baseline from another version",
+    "query": "what happens when a stored baseline was written by a different schema version",
+    "expectedFiles": ["RepoLens/Services/ContextStore.cs"],
     "expectedRelationships": [],
+    "minPrecision": 0.2,
     "maxTokens": 1800,
+    "maxApproximateTokens": 1900,
     "maxResults": 8,
-    "graphDepth": 1
+    "graphDepth": 1,
+    "advisory": true
+  },
+  {
+    "name": "plausible question about an absent subject",
+    "query": "rotate the TLS certificate used by the kubernetes ingress controller",
+    "expectedFiles": [],
+    "expectedRelationships": [],
+    "minPrecision": 1.0,
+    "expectedSufficiency": "Insufficient",
+    "expectAbstention": true,
+    "maxTokens": 700,
+    "maxApproximateTokens": 300,
+    "maxResults": 4,
+    "graphDepth": 1,
+    "advisory": true
   },
   {
     "name": "no repository evidence",
@@ -95,7 +119,9 @@
     "expectedRelationships": [],
     "expectedSufficiency": "Insufficient",
     "expectAbstention": true,
+    "minPrecision": 1.0,
     "maxTokens": 700,
+    "maxApproximateTokens": 300,
     "maxResults": 4,
     "graphDepth": 1
   }

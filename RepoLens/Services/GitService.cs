@@ -329,6 +329,13 @@ internal sealed class GitService(IProcessRunner processRunner)
         {
             throw new InvalidOperationException("Git is unavailable. Install Git and ensure it is on PATH.");
         }
+
+        if (result.State == ExecutionState.TimedOut)
+        {
+            throw new InvalidOperationException(
+                $"Git did not complete within its timeout: {result.Command}. "
+                + "Raise execution.processTimeoutSeconds, or check for a stuck lock in the repository.");
+        }
     }
 
     private static string? ValueOrNull(string value)

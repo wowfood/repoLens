@@ -1,0 +1,11 @@
+<Project>
+
+    <!-- Common settings shared by every project in the solution. Anything that varies
+         per project (TargetFramework, PackageId, etc.) stays in that project's own .csproj. -->
+    <PropertyGroup>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    </PropertyGroup>
+
+</Project>

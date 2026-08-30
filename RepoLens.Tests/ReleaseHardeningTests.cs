@@ -44,6 +44,55 @@ public sealed class ReleaseHardeningTests
     }
 
     [TestMethod]
+    public async Task TestCapture_IsNotCompleteWhenAProjectProducedNoResults()
+    {
+        var repository = CreateTemporaryDirectory();
+        var service = new TestService(new SilentProcessRunner());
+        var configuration = new DevContextConfig();
+        var projects = new RepositoryIndex
+        {
+            Solution = null,
+            Projects =
+            [
+                new ProjectRecord(
+                    "Sample.Tests",
+                    "tests/Sample.Tests/Sample.Tests.csproj",
+                    true,
+                    ["net8.0"],
+                    "enable",
+                    "latest",
+                    new CompilerSettingsRecord(null, false, null, null, null, null, false, false),
+                    [],
+                    [],
+                    [])
+            ]
+        };
+
+        try
+        {
+            var (tests, _) = await service.CaptureAsync(
+                repository,
+                configuration,
+                projects,
+                "silent-run",
+                new TestExecutionPlan("all", null),
+                CancellationToken.None);
+
+            // The process reported success but wrote no TRX, so nothing actually ran. Reporting
+            // this as a complete run with zero failures would let verification conclude that a
+            // suite which never executed introduced no regressions.
+            Assert.AreEqual(0, tests.Failed);
+            Assert.IsFalse(tests.IsComplete);
+            Assert.IsNotNull(tests.Detail);
+            StringAssert.Contains(tests.Detail, "produced no");
+        }
+        finally
+        {
+            Directory.Delete(repository, true);
+        }
+    }
+
+    [TestMethod]
     public async Task CoverageCollection_PersistsCoberturaOutsideRawTestResults()
     {
         var repository = CreateTemporaryDirectory();
@@ -120,6 +169,32 @@ public sealed class ReleaseHardeningTests
         }
     }
 
+    [TestMethod]
+    public void CoverageLookup_MatchesOnPathSegmentsAndPrefersTheLongestCandidate()
+    {
+        var coverage = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["tests/Ordering/Service.cs"] = 10d,
+            ["work/src/Ordering/Service.cs"] = 90d,
+            ["Service.cs"] = 50d
+        };
+
+        // A bare EndsWith match lets a same-named file under tests/ answer for one under src/, and
+        // resolving over an unordered dictionary with FirstOrDefault picks a different candidate from
+        // one run to the next. The suffix must align on a separator, and the longest match wins.
+        Assert.AreEqual(90d, RepositoryIntelligenceService.TryFindCoverage(coverage, "src/Ordering/Service.cs"));
+        Assert.AreEqual(
+            RepositoryIntelligenceService.TryFindCoverage(coverage, "src/Ordering/Service.cs"),
+            RepositoryIntelligenceService.TryFindCoverage(
+                new Dictionary<string, double>(coverage.Reverse().ToDictionary(), StringComparer.OrdinalIgnoreCase),
+                "src/Ordering/Service.cs"));
+
+        Assert.IsNull(
+            RepositoryIntelligenceService.TryFindCoverage(
+                new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase) { ["OtherService.cs"] = 10d },
+                "src/Service.cs"),
+            "A filename that merely ends with the same characters is not the same file.");
+    }
     [TestMethod]
     public async Task RetainedReports_ExposeDiagnosticFailureChurnAndCoverageDeltas()
     {
@@ -269,6 +344,77 @@ public sealed class ReleaseHardeningTests
         var path = Path.Combine(Path.GetTempPath(), $"dev-context-release-{Guid.NewGuid():N}");
         Directory.CreateDirectory(path);
         return path;
+    }
+
+    /// <summary>A runner that reports success without producing any test results.</summary>
+    [TestMethod]
+    public async Task TestCapture_ReportsATimedOutRunAsTimedOutAndIncomplete()
+    {
+        var repository = CreateTemporaryDirectory();
+        var service = new TestService(new TimingOutProcessRunner());
+        var projects = new RepositoryIndex
+        {
+            Solution = null,
+            Projects =
+            [
+                new ProjectRecord(
+                    "Sample.Tests",
+                    "tests/Sample.Tests/Sample.Tests.csproj",
+                    true,
+                    ["net8.0"],
+                    "enable",
+                    "latest",
+                    new CompilerSettingsRecord(null, false, null, null, null, null, false, false),
+                    [],
+                    [],
+                    [])
+            ]
+        };
+
+        try
+        {
+            var (tests, _) = await service.CaptureAsync(
+                repository,
+                new DevContextConfig(),
+                projects,
+                "timed-out-run",
+                new TestExecutionPlan("all", null),
+                CancellationToken.None);
+
+            // A terminated run reached no verdict at all, which is a different thing from a run that
+            // finished and found failures. Collapsing the two would let a hung suite read as clean.
+            Assert.AreEqual(ExecutionState.TimedOut, tests.State);
+            Assert.AreEqual(0, tests.Failed);
+            Assert.IsFalse(tests.IsComplete);
+        }
+        finally
+        {
+            Directory.Delete(repository, true);
+        }
+    }
+
+    private sealed class TimingOutProcessRunner : IProcessRunner
+    {
+        public Task<ProcessResult> RunAsync(
+            string executable,
+            IReadOnlyList<string> arguments,
+            string workingDirectory,
+            CancellationToken cancellationToken) => Task.FromResult(new ProcessResult(
+            ExecutionState.TimedOut,
+            null,
+            string.Empty,
+            "The command exceeded its 900s timeout and was terminated.",
+            900_000,
+            executable));
+    }
+    private sealed class SilentProcessRunner : IProcessRunner
+    {
+        public Task<ProcessResult> RunAsync(
+            string executable,
+            IReadOnlyList<string> arguments,
+            string workingDirectory,
+            CancellationToken cancellationToken) =>
+            Task.FromResult(new ProcessResult(ExecutionState.Succeeded, 0, string.Empty, string.Empty, 0, executable));
     }
 
     private sealed class CoverageProcessRunner : IProcessRunner

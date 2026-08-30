@@ -1,0 +1,9 @@
+namespace Ordering;
+
+/// <summary>Persistence boundary for orders.</summary>
+public interface IOrderRepository
+{
+    Task SaveAsync(Order order, CancellationToken cancellationToken = default);
+
+    Task<Order?> FindAsync(string orderId, CancellationToken cancellationToken = default);
+}

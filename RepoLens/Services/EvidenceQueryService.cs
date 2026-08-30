@@ -175,6 +175,17 @@ internal sealed partial class EvidenceQueryService(
             }
 
             selectionTruncated |= lexical.Truncated;
+            queryGaps.AddRange(lexical.Gaps);
+        }
+        else if (constrainedToIndexedSymbols)
+        {
+            // Filters deliberately disable the unconstrained lexical path, because a text hit in an
+            // arbitrary file cannot be attributed to a project or declaration kind and would quietly
+            // escape the scope the caller asked for. That is the right behaviour and the wrong
+            // silence: without this the result looks like a complete search of the repository.
+            queryGaps.Add(
+                "Filtered queries search indexed declarations only; files with matching text but no "
+                + "matching declaration were not considered.");
         }
 
         var relationships = BuildRelationships(blocks, graph.Dependencies.Symbols);
@@ -261,9 +272,10 @@ internal sealed partial class EvidenceQueryService(
                 decision);
         }
 
-        while (EstimateTokens(prompt) > options.MaxTokens && gaps.Count > 0)
+        if (EstimateTokens(prompt) > options.MaxTokens && blocks.Count > 0)
         {
-            gaps.RemoveAt(gaps.Count - 1);
+            blocks.Clear();
+            relationships = [];
             truncated = true;
             decision = EvaluateSufficiency(blocks, relationships, completeness, gaps, truncated);
             bundleId = CreateBundleId(
@@ -284,10 +296,11 @@ internal sealed partial class EvidenceQueryService(
                 decision);
         }
 
-        if (EstimateTokens(prompt) > options.MaxTokens && blocks.Count > 0)
+        while (EstimateTokens(prompt) > options.MaxTokens && gaps.Count > 1)
         {
-            blocks.Clear();
-            relationships = [];
+            gaps.RemoveAt(gaps.Count - 1);
+            gaps[^1] = "Some analysis gaps were omitted to fit the token budget; "
+                       + "treat this result as incomplete.";
             truncated = true;
             decision = EvaluateSufficiency(blocks, relationships, completeness, gaps, truncated);
             bundleId = CreateBundleId(
@@ -329,12 +342,14 @@ internal sealed partial class EvidenceQueryService(
         };
     }
 
-    private static Dictionary<string, Candidate> ScoreSymbols(
+    internal static Dictionary<string, Candidate> ScoreSymbols(
         IEnumerable<SymbolRecord> symbols,
         string query,
         IReadOnlyList<string> terms,
-        ISet<string>? changedFiles)
+        ISet<string>? changedFiles,
+        EvidenceRankingWeights? rankingWeights = null)
     {
+        var weights = rankingWeights ?? EvidenceRankingWeights.Default;
         var symbolArray = symbols.ToArray();
         var documentFrequency = terms.ToDictionary(
             term => term,
@@ -353,51 +368,51 @@ internal sealed partial class EvidenceQueryService(
             if (symbol.Name.Equals(query, StringComparison.OrdinalIgnoreCase)
                 || string.Equals(symbol.SemanticName, query, StringComparison.OrdinalIgnoreCase))
             {
-                score += 1000;
+                score += weights.ExactSymbolMatch;
                 reasons.Add("exact symbol match");
             }
 
+            var nameWords = IdentifierWords(symbol.Name);
+            var semanticWords = IdentifierWords(symbol.SemanticName ?? string.Empty);
+            var fileWords = IdentifierWords(Path.GetFileNameWithoutExtension(symbol.File));
             foreach (var term in terms)
             {
                 var rarity = 1d + Math.Log(
                     1d + symbolArray.Length / (double)(1 + documentFrequency.GetValueOrDefault(term)));
-                var nameWords = IdentifierWords(symbol.Name);
-                var semanticWords = IdentifierWords(symbol.SemanticName ?? string.Empty);
-                var fileWords = IdentifierWords(Path.GetFileNameWithoutExtension(symbol.File));
                 if (nameWords.Contains(term, StringComparer.OrdinalIgnoreCase))
                 {
-                    score += (int)Math.Round(180 * rarity);
+                    score += (int)Math.Round(weights.SymbolNameWord * rarity);
                     reasons.Add($"symbol word matches '{term}'");
                 }
                 else if (symbol.Name.Contains(term, StringComparison.OrdinalIgnoreCase))
                 {
-                    score += (int)Math.Round(45 * rarity);
+                    score += (int)Math.Round(weights.SymbolNameSubstring * rarity);
                     reasons.Add($"symbol name contains '{term}'");
                 }
                 else if (semanticWords.Contains(term, StringComparer.OrdinalIgnoreCase))
                 {
-                    score += (int)Math.Round(70 * rarity);
+                    score += (int)Math.Round(weights.SemanticNameWord * rarity);
                     reasons.Add($"semantic name matches word '{term}'");
                 }
-
                 if (fileWords.Contains(term, StringComparer.OrdinalIgnoreCase))
                 {
-                    score += (int)Math.Round(55 * rarity);
+                    score += (int)Math.Round(weights.FileNameWord * rarity);
                     reasons.Add($"file name matches '{term}'");
                 }
+
             }
 
-            if (changedFiles?.Contains(symbol.File) == true)
-            {
-                score += 250;
-                reasons.Add("declaration changed since baseline");
-            }
+            // No changed-file boost here. When changedFiles is set every surviving symbol is in a
+            // changed file — the guard above dropped the rest — so adding a constant to all of them
+            // reordered nothing and put the same sentence in every selection-reason list. The
+            // restriction to changed seeds is the documented behaviour of --changed; graph expansion
+            // still reaches unchanged declarations from those seeds.
 
             if (score > 0)
             {
                 if (symbol.Kind is "method" or "test")
                 {
-                    score += 30;
+                    score += weights.ExecutableDeclaration;
                     reasons.Add("focused executable declaration");
                 }
 
@@ -408,12 +423,14 @@ internal sealed partial class EvidenceQueryService(
         return result;
     }
 
-    private static void ExpandThroughGraph(
+    internal static void ExpandThroughGraph(
         IDictionary<string, Candidate> candidates,
         IReadOnlyDictionary<string, SymbolRecord> symbols,
         IReadOnlyList<SymbolReference> references,
-        int depth)
+        int depth,
+        EvidenceRankingWeights? rankingWeights = null)
     {
+        var weights = rankingWeights ?? EvidenceRankingWeights.Default;
         var frontier = candidates.Keys.ToHashSet(StringComparer.Ordinal);
         for (var level = 1; level <= depth && frontier.Count > 0; level++)
         {
@@ -431,7 +448,7 @@ internal sealed partial class EvidenceQueryService(
             {
                 candidates[identity] = new Candidate(
                     related.Symbol,
-                    Math.Min(1000, related.Score),
+                    Math.Min(weights.GraphScoreCeiling, related.Score),
                     related.Reasons.Distinct(StringComparer.Ordinal).ToArray());
                 next.Add(identity);
             }
@@ -449,7 +466,9 @@ internal sealed partial class EvidenceQueryService(
                 var anchorScore = candidates[anchor].Score;
                 var contribution = Math.Max(
                     1,
-                    RelationshipWeight(relationship) + Math.Min(200, anchorScore / 4) - level * 15);
+                    weights.RelationshipWeight(relationship)
+                    + Math.Min(weights.GraphAnchorShareCeiling, anchorScore / weights.GraphAnchorShareDivisor)
+                    - level * weights.GraphLevelPenalty);
                 if (!relatedCandidates.TryGetValue(related, out var accumulated))
                 {
                     accumulated = (symbol, 0, []);
@@ -552,18 +571,26 @@ internal sealed partial class EvidenceQueryService(
     {
         if (limit < 1 || tokenBudget < 32 || terms.Count == 0)
         {
-            return new LexicalSelection([], false, false);
+            return new LexicalSelection([], false, false, []);
         }
 
         var inventory = await fileFilter.GetFilesAsync(repositoryRoot, indexing, cancellationToken);
         var matches = new List<FileMatch>();
-        foreach (var path in EnumerateCandidateFiles(repositoryRoot, inventory)
-                     .Take(indexing.MaxEvidenceFilesScanned))
+        var candidates = EnumerateCandidateFiles(repositoryRoot, inventory).ToArray();
+        var scannedFiles = Math.Min(candidates.Length, indexing.MaxEvidenceFilesScanned);
+        var oversizedFiles = 0;
+        foreach (var path in candidates.Take(indexing.MaxEvidenceFilesScanned))
         {
             cancellationToken.ThrowIfCancellationRequested();
             var relative = Path.GetRelativePath(repositoryRoot, path).Replace('\\', '/');
-            if (excludedFiles.Contains(relative) || new FileInfo(path).Length > indexing.MaxEvidenceFileBytes)
+            if (excludedFiles.Contains(relative))
             {
+                continue;
+            }
+
+            if (new FileInfo(path).Length > indexing.MaxEvidenceFileBytes)
+            {
+                oversizedFiles++;
                 continue;
             }
 
@@ -674,7 +701,26 @@ internal sealed partial class EvidenceQueryService(
             usedTokens += blockTokens;
         }
 
-        return new LexicalSelection(result, truncated, highConfidence);
+        // The scan gave up in two ways without saying so. It stops after MaxEvidenceFilesScanned in
+        // ordinal path order, which biases toward alphabetically-early directories, and it skips
+        // files over MaxEvidenceFileBytes entirely. Unreported, a query that missed its answer
+        // because of a limit looked exactly like one whose answer does not exist.
+        var scanGaps = new List<string>();
+        if (candidates.Length > scannedFiles)
+        {
+            scanGaps.Add(
+                $"Scanned {scannedFiles} of {candidates.Length} candidate files for lexical evidence "
+                + "in path order; later paths were not examined.");
+        }
+
+        if (oversizedFiles > 0)
+        {
+            scanGaps.Add(
+                $"Skipped {oversizedFiles} file(s) larger than indexing.maxEvidenceFileBytes "
+                + "when scanning for lexical evidence.");
+        }
+
+        return new LexicalSelection(result, truncated, highConfidence, scanGaps);
     }
 
     private static IReadOnlyList<EvidenceRelationship> BuildRelationships(
@@ -983,17 +1029,6 @@ internal sealed partial class EvidenceQueryService(
         .Distinct(StringComparer.OrdinalIgnoreCase)
         .ToArray();
 
-    private static int RelationshipWeight(string relationship) => relationship switch
-    {
-        "override" or "interface-implementation" => 130,
-        "call" or "method-call" or "construct" or "constructs" or "constructed-type"
-            or "member-read" or "member-write" => 115,
-        "event-subscription" or "delegate-callback" => 105,
-        "inheritance" or "interface" or "generic-type-argument" => 95,
-        "dependency-injection" or "markup-binding" or "markup-event" or "component-use" => 85,
-        _ => 70
-    };
-
     private static bool Overlaps(EvidenceBlock left, EvidenceBlock right) =>
         left.File.Equals(right.File, StringComparison.OrdinalIgnoreCase)
         && left.StartLine <= right.EndLine
@@ -1028,7 +1063,7 @@ internal sealed partial class EvidenceQueryService(
     [GeneratedRegex("[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]+", RegexOptions.CultureInvariant)]
     private static partial Regex CamelCasePattern();
 
-    private sealed record Candidate(SymbolRecord Symbol, int Score, IReadOnlyList<string> Reasons);
+    internal sealed record Candidate(SymbolRecord Symbol, int Score, IReadOnlyList<string> Reasons);
 
     private sealed record EvidenceDecision(
         EvidenceSufficiency Sufficiency,
@@ -1045,5 +1080,6 @@ internal sealed partial class EvidenceQueryService(
     private sealed record LexicalSelection(
         IReadOnlyList<EvidenceBlock> Blocks,
         bool Truncated,
-        bool HighConfidence);
+        bool HighConfidence,
+        IReadOnlyList<string> Gaps);
 }

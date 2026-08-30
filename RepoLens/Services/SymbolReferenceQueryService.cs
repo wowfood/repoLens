@@ -12,6 +12,17 @@ internal sealed class SymbolReferenceQueryService(RepositoryGraphService graphSe
         "method-call", "delegate-callback", "markup-event"
     };
 
+    /// <summary>
+    /// Relations whose matches are declared by the resolved symbol itself, so only the declaring
+    /// project can contain them. Every other relation is inbound and can be declared anywhere that
+    /// references the declaring project.
+    /// </summary>
+    private static readonly HashSet<SymbolReferenceRelation> OutboundRelations =
+    [
+        SymbolReferenceRelation.Callees,
+        SymbolReferenceRelation.Implementations
+    ];
+
     public async Task<SymbolReferenceQueryReport> QueryAsync(
         string repositoryRoot,
         DevContextConfig configuration,
@@ -34,6 +45,7 @@ internal sealed class SymbolReferenceQueryService(RepositoryGraphService graphSe
         var selectedMatches = matches.Take(options.MaxResults).ToList();
         var projects = selectedMatches
             .SelectMany(match => new[] { match.Source.Project, match.Target.Project })
+            .Concat(ReferenceScopeProjects(resolved, options.Relation, graph.Dependencies.Projects))
             .Append(resolved?.Project)
             .Where(project => project is not null)
             .Select(project => project!)
@@ -125,6 +137,27 @@ internal sealed class SymbolReferenceQueryService(RepositoryGraphService graphSe
             ApproximateTokens = EstimateTokens(markdown),
             Markdown = markdown
         };
+    }
+
+    /// <summary>
+    /// Returns every project whose semantic analysis must be complete before an empty result can be
+    /// read as proof of absence. An inbound edge can be declared by any project that transitively
+    /// references the declaring project, so the completeness of the declaring project alone says
+    /// nothing about whether a caller exists in a project that failed to compile.
+    /// </summary>
+    internal static IReadOnlySet<string> ReferenceScopeProjects(
+        SymbolRecord? resolved,
+        SymbolReferenceRelation relation,
+        IReadOnlyList<ProjectDependency> projectDependencies)
+    {
+        if (resolved is null)
+        {
+            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        return OutboundRelations.Contains(relation)
+            ? new HashSet<string>([resolved.Project], StringComparer.OrdinalIgnoreCase)
+            : ProjectOwnershipResolver.ExpandAffectedProjects([resolved.Project], projectDependencies);
     }
 
     private static IReadOnlyList<SymbolRecord> Resolve(
