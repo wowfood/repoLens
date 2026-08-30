@@ -44,6 +44,17 @@ try {
         & dotnet $cli init | Out-Null
         if ($LASTEXITCODE -ne 0) { throw 'dev-context init failed in the fixture repository.' }
 
+        # A fixture that did not restore cleanly still runs, and every case simply reports about a
+        # hundred extra tokens and a downgraded sufficiency verdict -- which looks exactly like a
+        # retrieval regression. Fail on the cause instead of on the symptom.
+        $probe = & dotnet $cli query 'volume discount threshold' --format json --max-tokens 900
+        if ($LASTEXITCODE -ne 0) { throw 'dev-context query failed in the fixture repository.' }
+        $gaps = ($probe | ConvertFrom-Json).analysisGaps
+        if ($gaps.Count -gt 0) {
+            throw ("The fixture repository does not analyze cleanly, so benchmark numbers are not " +
+                   "comparable. Gaps: " + ($gaps -join ' | '))
+        }
+
         & dotnet $cli benchmark $corpus
         $benchmarkExit = $LASTEXITCODE
 

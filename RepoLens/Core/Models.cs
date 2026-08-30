@@ -715,6 +715,15 @@ public sealed record SymbolRecord(
 {
     public string? SemanticName { get; init; }
     public int? EndLine { get; init; }
+
+    /// <summary>
+    /// True when this record came from the declaration site that carries the body of a partial
+    /// type or member. Partial declarations share one identity, so only one record survives; this
+    /// decides which, and it is not persisted because it describes the choice rather than the
+    /// symbol.
+    /// </summary>
+    [JsonIgnore]
+    public bool IsPartialImplementation { get; init; }
 }
 
 public sealed record SourceLocationRecord(string File, int Line)

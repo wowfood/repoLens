@@ -356,6 +356,245 @@ public sealed class RepositoryAndSymbolTests
     }
 
     [TestMethod]
+    public async Task SymbolIndexer_AttributesTopLevelStatementsToASyntheticEntryPoint()
+    {
+        var root = CreateTemporaryDirectory();
+        Directory.CreateDirectory(Path.Combine(root, "src"));
+        await File.WriteAllTextAsync(
+            Path.Combine(root, "src", "Registry.cs"),
+            """
+            namespace Sample;
+            public interface IClock { }
+            public sealed class SystemClock : IClock { }
+            public sealed class Registry
+            {
+                public static Registry Create() => new();
+                public Registry Register<T>() => this;
+            }
+            """);
+
+        // A composition root written the way modern applications write one: no class, no Main, just
+        // statements. Everything here used to be discarded because FindContainingSymbol had nothing
+        // to attribute it to.
+        await File.WriteAllTextAsync(
+            Path.Combine(root, "src", "Program.cs"),
+            """
+            using Sample;
+            var registry = Registry.Create();
+            registry.Register<SystemClock>();
+            """);
+
+        try
+        {
+            var project = Project(
+                "Sample",
+                "src/Sample.csproj",
+                false,
+                [],
+                ["src/Registry.cs", "src/Program.cs"]) with
+            {
+                TargetFrameworks = ["net8.0"],
+                ReferenceResolutionState = ExecutionState.Succeeded,
+                CompilerSettings = new CompilerSettingsRecord(
+                    "Exe", true, null, null, "latest", null, false, false)
+            };
+            var repository = new RepositoryIndex { Solution = "Sample.sln", Projects = [project] };
+
+            var (symbols, dependencies) = await SymbolIndexer.BuildAsync(
+                root,
+                repository,
+                CancellationToken.None);
+
+            var entryPoint = symbols.Symbols.Single(symbol => symbol.Kind == "entry-point");
+            Assert.AreEqual("Main", entryPoint.Name);
+            Assert.AreEqual("src/Program.cs", entryPoint.File);
+
+            var create = symbols.Symbols.Single(symbol => symbol.Name == "Create");
+            var register = symbols.Symbols.Single(symbol => symbol.Name == "Register");
+
+            Assert.IsTrue(
+                dependencies.Symbols.Any(reference =>
+                    reference.SourceSymbol == entryPoint.Identity
+                    && reference.TargetSymbol == create.Identity
+                    && reference.Relationship == "method-call"),
+                "The entry point's call into the factory was not recorded.");
+            Assert.IsTrue(
+                dependencies.Symbols.Any(reference =>
+                    reference.SourceSymbol == entryPoint.Identity
+                    && reference.TargetSymbol == register.Identity
+                    && reference.Relationship == "method-call"),
+                "The entry point's registration call was not recorded.");
+        }
+        finally
+        {
+            TempDirectory.Delete(root);
+        }
+    }
+
+    [TestMethod]
+    public async Task SymbolIndexer_ResolvesAPartialMemberToItsImplementingDeclaration()
+    {
+        var root = CreateTemporaryDirectory();
+        Directory.CreateDirectory(Path.Combine(root, "src"));
+        await File.WriteAllTextAsync(
+            Path.Combine(root, "src", "Widget.Core.cs"),
+            """
+            namespace Sample;
+            public partial class Widget
+            {
+                public partial int Compute();
+                public int Alpha() => 1;
+            }
+            """);
+        await File.WriteAllTextAsync(
+            Path.Combine(root, "src", "Widget.Extra.cs"),
+            """
+            namespace Sample;
+            public partial class Widget
+            {
+                public partial int Compute() => Alpha();
+            }
+            """);
+
+        try
+        {
+            var project = Project(
+                "Sample",
+                "src/Sample.csproj",
+                false,
+                [],
+                ["src/Widget.Core.cs", "src/Widget.Extra.cs"]) with
+            {
+                TargetFrameworks = ["net8.0"],
+                ReferenceResolutionState = ExecutionState.Succeeded
+            };
+            var repository = new RepositoryIndex { Solution = "Sample.sln", Projects = [project] };
+
+            var (symbols, _) = await SymbolIndexer.BuildAsync(root, repository, CancellationToken.None);
+
+            // Both halves hash to the same identity, so only one record can survive. The defining
+            // declaration is a signature; answering "where is Compute?" with it sends the caller to
+            // a line with no code on it.
+            var compute = symbols.Symbols.Single(symbol => symbol.Name == "Compute");
+            Assert.AreEqual("src/Widget.Extra.cs", compute.File);
+        }
+        finally
+        {
+            TempDirectory.Delete(root);
+        }
+    }
+
+    [TestMethod]
+    public async Task SymbolIndexer_RecordsTypeofNameofAndAttributeReferences()
+    {
+        var root = CreateTemporaryDirectory();
+        Directory.CreateDirectory(Path.Combine(root, "src"));
+        await File.WriteAllTextAsync(
+            Path.Combine(root, "src", "Wiring.cs"),
+            """
+            using System;
+            namespace Sample;
+            [AttributeUsage(AttributeTargets.Class)]
+            public sealed class RegisteredAttribute : Attribute { }
+            public interface IClock { }
+            [Registered]
+            public sealed class SystemClock : IClock
+            {
+                public int Ticks { get; set; }
+            }
+            public sealed class Bootstrapper
+            {
+                public Type ClockType() => typeof(SystemClock);
+                public string TicksName() => nameof(SystemClock.Ticks);
+            }
+            """);
+
+        try
+        {
+            var project = Project("Sample", "src/Sample.csproj", false, [], ["src/Wiring.cs"]) with
+            {
+                TargetFrameworks = ["net8.0"],
+                ReferenceResolutionState = ExecutionState.Succeeded
+            };
+            var repository = new RepositoryIndex { Solution = "Sample.sln", Projects = [project] };
+
+            var (symbols, dependencies) = await SymbolIndexer.BuildAsync(
+                root,
+                repository,
+                CancellationToken.None);
+
+            var clock = symbols.Symbols.Single(symbol => symbol.Name == "SystemClock");
+            var ticks = symbols.Symbols.Single(symbol => symbol.Name == "Ticks");
+            var registered = symbols.Symbols.Single(symbol => symbol.Name == "RegisteredAttribute");
+            var clockType = symbols.Symbols.Single(symbol => symbol.Name == "ClockType");
+            var ticksName = symbols.Symbols.Single(symbol => symbol.Name == "TicksName");
+
+            Assert.IsTrue(
+                dependencies.Symbols.Any(reference =>
+                    reference.SourceSymbol == clockType.Identity
+                    && reference.TargetSymbol == clock.Identity
+                    && reference.Relationship == "typeof-reference"),
+                "typeof(SystemClock) produced no edge.");
+            Assert.IsTrue(
+                dependencies.Symbols.Any(reference =>
+                    reference.SourceSymbol == ticksName.Identity
+                    && reference.TargetSymbol == ticks.Identity
+                    && reference.Relationship == "nameof-reference"),
+                "nameof(SystemClock.Ticks) produced no edge, so a rename would not be traceable.");
+            Assert.IsTrue(
+                dependencies.Symbols.Any(reference =>
+                    reference.SourceSymbol == clock.Identity
+                    && reference.TargetSymbol == registered.Identity
+                    && reference.Relationship == "attribute"),
+                "The applied attribute produced no edge.");
+        }
+        finally
+        {
+            TempDirectory.Delete(root);
+        }
+    }
+
+    [TestMethod]
+    public async Task SymbolIndexer_IndexesDelegateDeclarations()
+    {
+        var root = CreateTemporaryDirectory();
+        Directory.CreateDirectory(Path.Combine(root, "src"));
+        await File.WriteAllTextAsync(
+            Path.Combine(root, "src", "Callbacks.cs"),
+            """
+            namespace Sample;
+            public delegate void StockChangedHandler(string sku, int quantity);
+            public sealed class Warehouse
+            {
+                public StockChangedHandler? StockChanged { get; set; }
+            }
+            """);
+
+        try
+        {
+            var project = Project("Sample", "src/Sample.csproj", false, [], ["src/Callbacks.cs"]) with
+            {
+                TargetFrameworks = ["net8.0"],
+                ReferenceResolutionState = ExecutionState.Succeeded
+            };
+            var repository = new RepositoryIndex { Solution = "Sample.sln", Projects = [project] };
+
+            var (symbols, _) = await SymbolIndexer.BuildAsync(root, repository, CancellationToken.None);
+
+            // A delegate is a type, but not a BaseTypeDeclarationSyntax, so it fell through both the
+            // type loop and the member loop and was absent from the graph entirely.
+            var handler = symbols.Symbols.Single(symbol => symbol.Kind == "delegate");
+            Assert.AreEqual("StockChangedHandler", handler.Name);
+            Assert.AreEqual("src/Callbacks.cs", handler.File);
+            Assert.AreEqual("Sample", handler.Namespace);
+        }
+        finally
+        {
+            TempDirectory.Delete(root);
+        }
+    }
+
+    [TestMethod]
     public async Task SymbolIndexer_IndexesLocalFunctionsWithOperationEvidence()
     {
         var root = CreateTemporaryDirectory();

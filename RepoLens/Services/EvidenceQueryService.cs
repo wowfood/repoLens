@@ -63,6 +63,11 @@ internal sealed partial class EvidenceQueryService(
             }
         }
 
+        if (ExtractionCoverage.UnknownKindGap(options.Kinds) is { } unknownKindGap)
+        {
+            queryGaps.Add(unknownKindGap);
+        }
+
         var terms = QueryTerms(options.Query);
         var compoundTerms = CompoundIdentifierTerms(options.Query);
         var projectLookup = graph.Repository.Projects.ToDictionary(

@@ -492,6 +492,13 @@ public sealed class DevContextApi
             ["--version"],
             cancellationToken);
         checks.Add(new DoctorCheck(
+            "Extraction coverage",
+            DoctorCheckState.Informational,
+            $"Contract {ExtractionCoverage.Identifier}: {ExtractionCoverage.DeclarationKinds.Count} "
+            + $"declaration kind(s), {ExtractionCoverage.RelationshipKinds.Count} relationship kind(s), "
+            + $"{ExtractionCoverage.KnownLimits.Count} known limit(s).",
+            string.Join(" ", ExtractionCoverage.KnownLimits)));
+        checks.Add(new DoctorCheck(
             "Baseline",
             DoctorCheckState.Informational,
             BaselineExists ? "A baseline is available." : "No baseline exists; stateless API operations remain available."));

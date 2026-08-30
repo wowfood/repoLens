@@ -1,3 +1,5 @@
+using DevContext.Core;
+
 namespace DevContext.Tests;
 
 internal static class TempDirectory
@@ -35,4 +37,32 @@ internal static class TempDirectory
             }
         }
     }
+}
+
+internal static class TestHelpers
+{
+    public static string CreateTemporaryDirectory()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"repolens-tests-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(path);
+        return path;
+    }
+
+    /// <summary>A single-project repository index over the given sources, evaluated as if restored.</summary>
+    public static ProjectRecord SampleProject(params string[] sources) =>
+        new(
+            "Sample",
+            "src/Sample.csproj",
+            false,
+            ["net8.0"],
+            "enable",
+            "14.0",
+            new CompilerSettingsRecord("Library", true, null, null, "latest", null, false, false),
+            [],
+            [],
+            sources)
+        {
+            AssemblyName = "Sample",
+            ReferenceResolutionState = ExecutionState.Succeeded
+        };
 }

@@ -230,7 +230,24 @@ internal static class SymbolIndexer
             .ThenBy(reference => reference.TargetSymbol, StringComparer.Ordinal)
             .ThenBy(reference => reference.Relationship, StringComparer.Ordinal)
             .ToArray();
+        // Partial types and partial members declared across several files share one identity, so only
+        // one record can survive. Deduplicating before ordering left that choice to whichever project
+        // task happened to append first, and the survivor was as likely to be the bodyless half --
+        // "where is Compute implemented?" answered with the signature. Order first, and put the
+        // declaration site that carries a body ahead of the one that does not.
+        //
+        // Hand-written source outranks a body, though, and that ordering is not cosmetic: a
+        // [GeneratedRegex] method is a partial whose implementation is a generated DFA, so preferring
+        // the body alone moved every regex in this repository from the file that declares the pattern
+        // to a machine-written file nobody can edit. The benchmark caught it as a total recall
+        // collapse on two cases. The useful answer is the code a person wrote.
         var orderedSymbols = symbols
+            .OrderBy(symbol => symbol.Project, StringComparer.Ordinal)
+            .ThenBy(symbol => IsGeneratedPath(symbol.File))
+            .ThenByDescending(symbol => symbol.IsPartialImplementation)
+            .ThenBy(symbol => symbol.File, StringComparer.Ordinal)
+            .ThenBy(symbol => symbol.Line)
+            .ThenBy(symbol => symbol.Identity, StringComparer.Ordinal)
             .DistinctBy(symbol => symbol.Identity, StringComparer.Ordinal)
             .OrderBy(symbol => symbol.Project, StringComparer.Ordinal)
             .ThenBy(symbol => symbol.File, StringComparer.Ordinal)
@@ -1011,6 +1028,45 @@ internal static class SymbolIndexer
                 interfaces)
             {
                 SemanticName = semanticName,
+                EndLine = EndLineOf(declaration),
+                IsPartialImplementation = declaration is TypeDeclarationSyntax { Members.Count: > 0 }
+            };
+            symbols.Add(record);
+            if (semanticSymbol is not null)
+            {
+                declaredSymbols[NormalizeSymbol(semanticSymbol)] = record;
+            }
+        }
+
+        // Delegates are types but not BaseTypeDeclarationSyntax, so the loop above never sees them
+        // and they are also not among the member kinds IndexMembers yields. Without this they are
+        // absent from the graph entirely, and a callback contract is exactly the kind of indirection
+        // an agent asks about.
+        foreach (var declaration in root.DescendantNodes().OfType<DelegateDeclarationSyntax>())
+        {
+            var semanticSymbol = model.GetDeclaredSymbol(declaration);
+            var namespaceName = semanticSymbol?.ContainingNamespace.IsGlobalNamespace == false
+                ? semanticSymbol.ContainingNamespace.ToDisplayString()
+                : NamespaceOf(declaration);
+            var containingType = semanticSymbol?.ContainingType?.Name
+                                 ?? declaration.Ancestors().OfType<BaseTypeDeclarationSyntax>()
+                                     .FirstOrDefault()?.Identifier.Text;
+            var semanticName = semanticSymbol?.ToDisplayString(SymbolDisplayFormat.CSharpErrorMessageFormat)
+                               ?? string.Join('.', new[] { namespaceName, containingType, declaration.Identifier.Text }
+                                   .Where(part => !string.IsNullOrWhiteSpace(part)));
+            var record = new SymbolRecord(
+                Hashing.Text(string.Join('|', project.Path, "delegate", semanticName)),
+                "delegate",
+                declaration.Identifier.Text,
+                namespaceName,
+                containingType,
+                project.Path,
+                file,
+                LineOf(declaration),
+                null,
+                [])
+            {
+                SemanticName = semanticName,
                 EndLine = EndLineOf(declaration)
             };
             symbols.Add(record);
@@ -1020,6 +1076,17 @@ internal static class SymbolIndexer
             }
         }
     }
+
+    /// <summary>
+    /// The entry point a file of top-level statements compiles into. Roslyn synthesizes it, so it is
+    /// <c>IsImplicitlyDeclared</c> and <see cref="IndexMembers"/> skips it — which left every
+    /// statement in a <c>Program.cs</c> with no containing symbol, so the composition root of a
+    /// modern application was structurally invisible and none of its wiring produced an edge.
+    /// </summary>
+    private static IMethodSymbol? TopLevelEntryPoint(SyntaxNode root, SemanticModel model) =>
+        root is CompilationUnitSyntax unit && unit.Members.OfType<GlobalStatementSyntax>().Any()
+            ? model.GetDeclaredSymbol(unit)
+            : null;
 
     private static void IndexMembers(
         SyntaxNode root,
@@ -1067,10 +1134,39 @@ internal static class SymbolIndexer
                 [])
             {
                 SemanticName = semanticName,
-                EndLine = EndLineOf(declaration)
+                EndLine = EndLineOf(declaration),
+                IsPartialImplementation = HasBody(declaration)
             };
             symbols.Add(record);
             declaredSymbols[NormalizeSymbol(semanticSymbol)] = record;
+        }
+
+        if (TopLevelEntryPoint(root, model) is { } entryPoint)
+        {
+            var statements = ((CompilationUnitSyntax)root).Members.OfType<GlobalStatementSyntax>().ToArray();
+            var semanticName = entryPoint.ToDisplayString(SymbolDisplayFormat.CSharpErrorMessageFormat);
+
+            // Named "Main" rather than the synthesized "<Main>$": the angle-bracket form matches
+            // nothing an agent would type, and the concept a caller is looking for is the entry point.
+            var record = new SymbolRecord(
+                Hashing.Text(string.Join('|', project.Path, "member", "entry-point", semanticName)),
+                "entry-point",
+                "Main",
+                entryPoint.ContainingNamespace is { IsGlobalNamespace: false } entryNamespace
+                    ? entryNamespace.ToDisplayString()
+                    : NamespaceOf(root),
+                entryPoint.ContainingType?.Name,
+                project.Path,
+                file,
+                LineOf(statements[0]),
+                null,
+                [])
+            {
+                SemanticName = semanticName,
+                EndLine = EndLineOf(statements[^1])
+            };
+            symbols.Add(record);
+            declaredSymbols[NormalizeSymbol(entryPoint)] = record;
         }
     }
 
@@ -1257,6 +1353,82 @@ internal static class SymbolIndexer
                 }
             }
 
+            // typeof, nameof and attributes are how a lot of real wiring is written -- DI
+            // registrations by type token, [MemberNotNull(nameof(Field))], serializer and test
+            // attributes -- and none of it produced an edge. A rename that misses one of these is
+            // exactly the kind of break a structural index is supposed to be able to answer for.
+            foreach (var typeOf in root.DescendantNodes().OfType<TypeOfExpressionSyntax>())
+            {
+                AddTypeReferences(
+                    FindContainingSymbol(typeOf, model, declaredSymbols),
+                    model.GetTypeInfo(typeOf.Type, cancellationToken).Type,
+                    "typeof-reference",
+                    declaredSymbols,
+                    references,
+                    evidence: typeOf.Type,
+                    origin: "roslyn-semantic",
+                    targetFramework: targetFramework);
+            }
+
+            foreach (var nameOf in root.DescendantNodes().OfType<InvocationExpressionSyntax>())
+            {
+                if (nameOf is not
+                    {
+                        Expression: IdentifierNameSyntax { Identifier.ValueText: "nameof" },
+                        ArgumentList.Arguments: [{ } onlyArgument]
+                    })
+                {
+                    continue;
+                }
+
+                // A real method called "nameof" would resolve; the contextual keyword does not.
+                if (model.GetSymbolInfo(nameOf, cancellationToken).Symbol is not null)
+                {
+                    continue;
+                }
+
+                var source = FindContainingSymbol(nameOf, model, declaredSymbols);
+                var named = model.GetSymbolInfo(onlyArgument.Expression, cancellationToken).Symbol;
+                if (named is ITypeSymbol namedType)
+                {
+                    AddTypeReferences(
+                        source,
+                        namedType,
+                        "nameof-reference",
+                        declaredSymbols,
+                        references,
+                        evidence: onlyArgument.Expression,
+                        origin: "roslyn-semantic",
+                        targetFramework: targetFramework);
+                }
+                else
+                {
+                    AddReference(
+                        source,
+                        named,
+                        "nameof-reference",
+                        declaredSymbols,
+                        references,
+                        evidence: onlyArgument.Expression,
+                        origin: "roslyn-semantic",
+                        targetFramework: targetFramework);
+                }
+            }
+
+            foreach (var attribute in root.DescendantNodes().OfType<AttributeSyntax>())
+            {
+                AddTypeReferences(
+                    FindContainingSymbol(attribute, model, declaredSymbols)
+                    ?? FindContainingTypeSymbol(attribute, model, declaredSymbols),
+                    model.GetSymbolInfo(attribute, cancellationToken).Symbol?.ContainingType,
+                    "attribute",
+                    declaredSymbols,
+                    references,
+                    evidence: attribute.Name,
+                    origin: "roslyn-semantic",
+                    targetFramework: targetFramework);
+            }
+
             foreach (var genericName in root.DescendantNodes().OfType<GenericNameSyntax>())
             {
                 var source = FindContainingSymbol(genericName, model, declaredSymbols);
@@ -1431,6 +1603,16 @@ internal static class SymbolIndexer
             && declaredSymbols.TryResolve(typeSymbol, out var typeRecord))
         {
             return typeRecord;
+        }
+
+        // Top-level statements have neither a member nor a type declaration above them, so without
+        // this every reference in a Program.cs -- the DI registrations, the pipeline construction --
+        // was attributed to nothing and discarded.
+        if (node.Ancestors().OfType<GlobalStatementSyntax>().Any()
+            && TopLevelEntryPoint(node.SyntaxTree.GetRoot(), model) is { } entryPoint
+            && declaredSymbols.TryResolve(entryPoint, out var entryRecord))
+        {
+            return entryRecord;
         }
 
         return null;
@@ -1846,14 +2028,40 @@ internal static class SymbolIndexer
     private static string? NamespaceOf(SyntaxNode node) =>
         node.Ancestors().OfType<BaseNamespaceDeclarationSyntax>().FirstOrDefault()?.Name.ToString();
 
+    /// <summary>
+    /// Whether a declaration carries an implementation, which is what makes it the useful half of a
+    /// partial pair. A bodyless declaration is a signature, and pointing a caller at it is a worse
+    /// answer than pointing them at the code.
+    /// </summary>
+    private static bool HasBody(SyntaxNode declaration) => declaration switch
+    {
+        BaseMethodDeclarationSyntax method => method.Body is not null || method.ExpressionBody is not null,
+        PropertyDeclarationSyntax property =>
+            property.ExpressionBody is not null
+            || property.AccessorList?.Accessors.Any(accessor =>
+                accessor.Body is not null || accessor.ExpressionBody is not null) == true,
+        IndexerDeclarationSyntax indexer =>
+            indexer.ExpressionBody is not null
+            || indexer.AccessorList?.Accessors.Any(accessor =>
+                accessor.Body is not null || accessor.ExpressionBody is not null) == true,
+        EventDeclarationSyntax eventDeclaration =>
+            eventDeclaration.AccessorList?.Accessors.Any(accessor => accessor.Body is not null) == true,
+        LocalFunctionStatementSyntax local => local.Body is not null || local.ExpressionBody is not null,
+        VariableDeclaratorSyntax variable => variable.Initializer is not null,
+        _ => false
+    };
+
     private static int LineOf(SyntaxNode node) =>
         node.GetLocation().GetLineSpan().StartLinePosition.Line + 1;
 
     private static int EndLineOf(SyntaxNode node) =>
         node.GetLocation().GetLineSpan().EndLinePosition.Line + 1;
 
+    private static bool IsGeneratedPath(string path) =>
+        path.StartsWith("generated://", StringComparison.Ordinal);
+
     private static string NormalizeRelative(string repositoryRoot, string path) =>
-        path.StartsWith("generated://", StringComparison.Ordinal)
+        IsGeneratedPath(path)
             ? path
             : Path.GetRelativePath(repositoryRoot, path).Replace('\\', '/');
 }
