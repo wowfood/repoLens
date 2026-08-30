@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "repolens": {
+      "command": "dev-context",
+      "args": ["mcp"]
+    }
+  }
+}

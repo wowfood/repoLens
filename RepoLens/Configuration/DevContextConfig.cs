@@ -13,6 +13,18 @@ public sealed record DevContextConfig
     public StorageConfig Storage { get; init; } = new();
     public CacheConfig Cache { get; init; } = new();
     public IndexingConfig Indexing { get; init; } = new();
+    public ExecutionConfig Execution { get; init; } = new();
+}
+
+public sealed record ExecutionConfig
+{
+    /// <summary>
+    /// Wall-clock ceiling for a single external process. Without one, a hung <c>dotnet build</c>,
+    /// <c>dotnet test</c>, <c>git</c>, or analyzer blocks forever — and inside an MCP session that
+    /// hangs the agent with no way to recover. The default is generous because a real test suite
+    /// legitimately runs for minutes; it exists to bound a hang, not to police slowness.
+    /// </summary>
+    public int ProcessTimeoutSeconds { get; init; } = 900;
 }
 
 public sealed record TestConfig
@@ -154,6 +166,12 @@ internal static class ConfigLoader
         {
             throw new InvalidOperationException(
                 "indexing file-size limits must be at least 1024 bytes and maxEvidenceFilesScanned must be positive.");
+        }
+
+        if (config.Execution.ProcessTimeoutSeconds is < 1 or > 86_400)
+        {
+            throw new InvalidOperationException(
+                "execution.processTimeoutSeconds must be between 1 and 86400.");
         }
 
         if (config.Indexing.Exclude is null)

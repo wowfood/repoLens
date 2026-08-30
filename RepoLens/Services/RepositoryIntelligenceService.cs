@@ -75,6 +75,13 @@ internal sealed class RepositoryIntelligenceService(
             options.GitHistoryMonths,
             selection.Files,
             cancellationToken);
+        var contextGaps = new List<string>();
+        if (!churn.Available)
+        {
+            contextGaps.Add(
+                "Git history was unavailable, so hotspot churn, contributor, and recency values are "
+                + "absent rather than zero.");
+        }
         var (types, methods) = await BuildCodeMetricsAsync(
             repositoryRoot,
             graph,
@@ -86,7 +93,7 @@ internal sealed class RepositoryIntelligenceService(
             selection,
             diagnostics,
             coverage,
-            churn,
+            churn.Metrics,
             options.MaxHotspots,
             cancellationToken);
         var symbols = SelectSymbols(graph, selection, hotspots, options).ToArray();
@@ -125,6 +132,12 @@ internal sealed class RepositoryIntelligenceService(
             Types = types,
             Methods = methods,
             Hotspots = hotspots,
+            AnalysisGaps = contextGaps
+                .Concat(compilationCompleteness
+                    .Where(record => record.State != AnalysisCompletenessState.Complete)
+                    .SelectMany(record => record.Gaps.Select(gap => $"{record.Project}: {gap}")))
+                .Distinct(StringComparer.Ordinal)
+                .ToArray(),
             Markdown = string.Empty,
             ApproximateTokens = 0
         };
@@ -291,9 +304,7 @@ internal sealed class RepositoryIntelligenceService(
                            $"{report.CompilationCompleteness.Count(record => record.State == AnalysisCompletenessState.Partial)} partial / " +
                            $"{report.CompilationCompleteness.Count(record => record.State == AnalysisCompletenessState.Failed)} failed");
 
-        AppendList(builder, "Analysis gaps", report.CompilationCompleteness
-            .Where(record => record.State != AnalysisCompletenessState.Complete)
-            .SelectMany(record => record.Gaps.Select(gap => $"`{record.Project}`: {gap}")));
+        AppendList(builder, "Analysis gaps", report.AnalysisGaps);
 
         if (report.GitComparison != GitComparisonState.Comparable)
         {
@@ -681,7 +692,16 @@ internal sealed class RepositoryIntelligenceService(
         return (types, orderedMethods);
     }
 
-    private async Task<IReadOnlyDictionary<string, GitHistoryMetric>> ReadGitHistoryAsync(
+    /// <summary>
+    /// Git history for churn ranking. <c>Available</c> distinguishes "the repository has no history
+    /// in this window" from "the history could not be read", so a failed read is never reported as
+    /// zero churn.
+    /// </summary>
+    private sealed record GitHistory(
+        bool Available,
+        IReadOnlyDictionary<string, GitHistoryMetric> Metrics);
+
+    private async Task<GitHistory> ReadGitHistoryAsync(
         string repositoryRoot,
         int historyMonths,
         IReadOnlySet<string> scopedFiles,
@@ -694,7 +714,7 @@ internal sealed class RepositoryIntelligenceService(
             cancellationToken);
         if (result.State != ExecutionState.Succeeded)
         {
-            return new Dictionary<string, GitHistoryMetric>();
+            return new GitHistory(false, new Dictionary<string, GitHistoryMetric>());
         }
 
         var metrics = new Dictionary<string, GitHistoryMetric>(StringComparer.OrdinalIgnoreCase);
@@ -753,7 +773,7 @@ internal sealed class RepositoryIntelligenceService(
             }
         }
 
-        return metrics;
+        return new GitHistory(true, metrics);
     }
 
     internal static IReadOnlyDictionary<string, double> ReadCobertura(
@@ -849,18 +869,36 @@ internal sealed class RepositoryIntelligenceService(
         return result;
     }
 
-    private static double? TryFindCoverage(IReadOnlyDictionary<string, double> coverage, string file)
+    internal static double? TryFindCoverage(IReadOnlyDictionary<string, double> coverage, string file)
     {
         if (coverage.TryGetValue(file, out var exact))
         {
             return exact;
         }
 
+        // Cobertura filenames may be absolute or rooted differently from the repository-relative
+        // path, so a suffix match is the only available join. It must align on a path separator:
+        // a bare EndsWith lets "tests/A/Service.cs" satisfy a lookup for "src/A/Service.cs".
+        // Candidates are ordered longest-first, then ordinally, because the source is an unordered
+        // dictionary and FirstOrDefault over it would otherwise attach a different file's coverage
+        // from one run to the next.
         return coverage
-            .Where(pair => file.EndsWith(pair.Key, StringComparison.OrdinalIgnoreCase)
-                           || pair.Key.EndsWith(file, StringComparison.OrdinalIgnoreCase))
+            .Where(pair => IsPathSuffix(file, pair.Key) || IsPathSuffix(pair.Key, file))
+            .OrderByDescending(pair => pair.Key.Length)
+            .ThenBy(pair => pair.Key, StringComparer.Ordinal)
             .Select(pair => (double?)pair.Value)
             .FirstOrDefault();
+    }
+
+    private static bool IsPathSuffix(string path, string suffix)
+    {
+        if (!path.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var boundary = path.Length - suffix.Length;
+        return boundary == 0 || path[boundary - 1] == '/';
     }
 
     private static IEnumerable<SymbolRecord> SelectSymbols(

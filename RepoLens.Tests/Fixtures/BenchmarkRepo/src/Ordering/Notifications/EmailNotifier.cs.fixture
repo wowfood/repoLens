@@ -1,0 +1,17 @@
+namespace Ordering.Notifications;
+
+public sealed class EmailNotifier(string fromAddress) : INotifier
+{
+    private readonly List<string> sent = [];
+
+    public IReadOnlyList<string> Sent => sent;
+
+    public Task NotifyAsync(
+        string customerId,
+        string message,
+        CancellationToken cancellationToken = default)
+    {
+        sent.Add($"{fromAddress} -> {customerId}: {message}");
+        return Task.CompletedTask;
+    }
+}

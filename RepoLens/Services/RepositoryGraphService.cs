@@ -36,11 +36,28 @@ internal sealed record ProjectGraphCacheEntry
 
 internal sealed class RepositoryGraphService
 {
+    /// <summary>
+    /// The repository root and its graph as one value, so publishing them is a single reference
+    /// write. Two separate fields could be observed half-updated — a reader seeing the new root
+    /// beside the previous graph, which is the one combination that is silently wrong rather than
+    /// merely stale.
+    /// </summary>
+    private sealed record MemoizedGraph(string RepositoryRoot, RepositoryGraph Graph);
+
     private readonly IProcessRunner processRunner;
     private readonly ProjectIndexer projectIndexer;
     private readonly RepositoryFileFilter fileFilter;
-    private RepositoryGraph? inMemoryGraph;
-    private string? inMemoryRepositoryRoot;
+
+    /// <summary>
+    /// Serializes graph construction. Without it two concurrent MCP calls arriving on a cold cache
+    /// each run a full MSBuild evaluation and Roslyn compilation of the whole repository, which is
+    /// the most expensive thing this process does. One gate rather than one per repository root:
+    /// the service is created per <see cref="DevContext.DevContextApi"/> instance, which is itself
+    /// per repository, so a shared gate never serializes unrelated work in practice.
+    /// </summary>
+    private readonly SemaphoreSlim buildGate = new(1, 1);
+
+    private MemoizedGraph? memoized;
 
     public RepositoryGraphService(
         IProcessRunner processRunner,
@@ -65,22 +82,44 @@ internal sealed class RepositoryGraphService
             inventory,
             sdkVersion,
             cancellationToken);
+        if (config.Cache.Enabled && TryMemoized(repositoryRoot, inputHash) is { } warm)
+        {
+            return warm;
+        }
+
+        // Everything past here is expensive, so only one caller runs it at a time. The check above is
+        // repeated inside the gate because the caller that held it may have produced exactly the
+        // graph this one is waiting for.
+        await buildGate.WaitAsync(cancellationToken);
+        try
+        {
+            return await BuildUncachedAsync(
+                repositoryRoot,
+                config,
+                inventory,
+                sdkVersion,
+                inputHash,
+                cancellationToken);
+        }
+        finally
+        {
+            buildGate.Release();
+        }
+    }
+
+    private async Task<RepositoryGraph> BuildUncachedAsync(
+        string repositoryRoot,
+        DevContextConfig config,
+        RepositoryFileInventory inventory,
+        string sdkVersion,
+        string inputHash,
+        CancellationToken cancellationToken)
+    {
         if (config.Cache.Enabled)
         {
-            var memoryGraph = Volatile.Read(ref inMemoryGraph);
-            if (memoryGraph is not null
-                && string.Equals(
-                    Volatile.Read(ref inMemoryRepositoryRoot),
-                    repositoryRoot,
-                    StringComparison.OrdinalIgnoreCase)
-                && memoryGraph.InputHash.Equals(inputHash, StringComparison.Ordinal))
+            if (TryMemoized(repositoryRoot, inputHash) is { } warm)
             {
-                return memoryGraph with
-                {
-                    CacheHit = true,
-                    ProjectCacheHits = memoryGraph.Repository.Projects.Count,
-                    ProjectCacheMisses = 0
-                };
+                return warm;
             }
 
             var cached = await TryReadCacheAsync(repositoryRoot, inputHash, cancellationToken);
@@ -196,16 +235,27 @@ internal sealed class RepositoryGraphService
         return graph;
     }
 
-    public void ClearMemoryCache()
-    {
-        Volatile.Write(ref inMemoryGraph, null);
-        Volatile.Write(ref inMemoryRepositoryRoot, null);
-    }
+    public void ClearMemoryCache() => Volatile.Write(ref memoized, null);
 
-    private void Remember(string repositoryRoot, RepositoryGraph graph)
+    private void Remember(string repositoryRoot, RepositoryGraph graph) =>
+        Volatile.Write(ref memoized, new MemoizedGraph(repositoryRoot, graph));
+
+    private RepositoryGraph? TryMemoized(string repositoryRoot, string inputHash)
     {
-        Volatile.Write(ref inMemoryRepositoryRoot, repositoryRoot);
-        Volatile.Write(ref inMemoryGraph, graph);
+        var current = Volatile.Read(ref memoized);
+        if (current is null
+            || !string.Equals(current.RepositoryRoot, repositoryRoot, StringComparison.OrdinalIgnoreCase)
+            || !current.Graph.InputHash.Equals(inputHash, StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        return current.Graph with
+        {
+            CacheHit = true,
+            ProjectCacheHits = current.Graph.Repository.Projects.Count,
+            ProjectCacheMisses = 0
+        };
     }
 
     internal async Task<string> ComputeInputHashAsync(
@@ -233,7 +283,7 @@ internal sealed class RepositoryGraphService
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         Append(hash, $"schema:{SchemaVersions.Current}\n");
         Append(hash, $"sdk:{sdkVersion}\n");
-        Append(hash, JsonSerializer.Serialize(config, JsonDefaults.Options));
+        Append(hash, CacheKeyConfiguration(config));
 
         foreach (var relative in inventory.RelativePaths)
         {
@@ -266,7 +316,13 @@ internal sealed class RepositoryGraphService
             ["--version"],
             repositoryRoot,
             cancellationToken);
-        return sdk.StandardOutput.Trim();
+
+        // The result feeds the repository input hash. Taking the output without checking the state
+        // hashes an empty string whenever dotnet is missing or the call times out, quietly making two
+        // different toolchains — or a broken one — share a cache entry.
+        return sdk.State == ExecutionState.Succeeded
+            ? sdk.StandardOutput.Trim()
+            : $"unavailable:{sdk.State}";
     }
 
     private static async Task<IReadOnlyDictionary<string, string>> ComputeProjectInputHashesAsync(
@@ -532,19 +588,118 @@ internal sealed class RepositoryGraphService
                     cancellationToken);
             }
 
+            await SwapCacheAsync(repositoryRoot, pendingPath, cachePath, cancellationToken);
+        }
+        finally
+        {
+            TryDeleteDirectory(pendingPath);
+        }
+    }
+
+    /// <summary>
+    /// Replaces the cache directory with a freshly written one.
+    ///
+    /// The previous implementation deleted the cache and then renamed the new one into place, with
+    /// no coordination between processes and no error handling: two dev-context runs on the same
+    /// repository raced, and the resulting <see cref="IOException"/> failed the whole command. It
+    /// also left a window in which no cache existed at all, so a concurrent reader rebuilt from
+    /// scratch.
+    ///
+    /// Now a lock file serializes the swap between processes, the old directory is renamed aside
+    /// rather than deleted in place, and any failure leaves the existing cache untouched. The cache
+    /// is an optimization: failing to update it must never fail the command that produced the graph.
+    /// </summary>
+    private static async Task SwapCacheAsync(
+        string repositoryRoot,
+        string pendingPath,
+        string cachePath,
+        CancellationToken cancellationToken)
+    {
+        using var cacheLock = await TryAcquireCacheLockAsync(repositoryRoot, cancellationToken);
+        if (cacheLock is null)
+        {
+            return;
+        }
+
+        var discardedPath = Path.Combine(
+            ContextPaths.Root(repositoryRoot),
+            $".cache-discarded-{Guid.NewGuid():N}");
+        try
+        {
             if (Directory.Exists(cachePath))
             {
-                Directory.Delete(cachePath, true);
+                Directory.Move(cachePath, discardedPath);
             }
 
             Directory.Move(pendingPath, cachePath);
         }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            // Put back whatever was there before rather than leaving the repository with no cache.
+            if (!Directory.Exists(cachePath) && Directory.Exists(discardedPath))
+            {
+                TryMoveDirectory(discardedPath, cachePath);
+            }
+        }
         finally
         {
-            if (Directory.Exists(pendingPath))
+            TryDeleteDirectory(discardedPath);
+        }
+    }
+
+    private static async Task<FileStream?> TryAcquireCacheLockAsync(
+        string repositoryRoot,
+        CancellationToken cancellationToken)
+    {
+        var lockPath = ContextPaths.CacheLock(repositoryRoot);
+        for (var attempt = 0; attempt < 20; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
             {
-                Directory.Delete(pendingPath, true);
+                return new FileStream(
+                    lockPath,
+                    FileMode.OpenOrCreate,
+                    FileAccess.ReadWrite,
+                    FileShare.None,
+                    bufferSize: 1,
+                    FileOptions.DeleteOnClose);
             }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(50), cancellationToken);
+            }
+        }
+
+        // Another process is publishing its own cache. Its result is as valid as ours, and the graph
+        // this call produced is returned either way, so give up on writing rather than failing.
+        return null;
+    }
+
+    private static void TryMoveDirectory(string source, string destination)
+    {
+        try
+        {
+            Directory.Move(source, destination);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            // Best effort: the caller is already handling a failed swap.
+        }
+    }
+
+    private static void TryDeleteDirectory(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+            {
+                Directory.Delete(path, true);
+            }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            // A leftover temporary directory is recoverable; failing the command over it is not.
         }
     }
 
@@ -661,6 +816,18 @@ internal sealed class RepositoryGraphService
 
     private static string ProjectEntryPath(string directory, string projectPath) =>
         Path.Combine(directory, $"{Hashing.Text(projectPath)[..24]}.json");
+
+    /// <summary>
+    /// Serializes the configuration for use as a cache key with machine-dependent scheduling knobs
+    /// normalized away. <see cref="IndexingConfig.MaxParallelism"/> defaults to the processor count,
+    /// so including it verbatim would give the same repository a different graph hash on every
+    /// machine, and the persisted cache could never be compared or shared across runners. It changes
+    /// how the work is scheduled, never what the resulting graph contains.
+    /// </summary>
+    private static string CacheKeyConfiguration(DevContextConfig config) =>
+        JsonSerializer.Serialize(
+            config with { Indexing = config.Indexing with { MaxParallelism = 0 } },
+            JsonDefaults.Options);
 
     private static string SemanticIndexingConfiguration(IndexingConfig indexing) =>
         JsonSerializer.Serialize(

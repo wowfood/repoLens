@@ -1,0 +1,35 @@
+namespace Inventory;
+
+/// <summary>
+/// Reconciles the ledger against the nightly warehouse export. Deliberately shares vocabulary with
+/// <see cref="StockLedger"/> — warehouse, stock, units, sku — without being involved in reserving
+/// stock for a purchase, so that a query about reservations has something plausible to reject.
+/// </summary>
+public sealed class WarehouseSync(StockLedger ledger)
+{
+    public int Reconcile(IReadOnlyDictionary<string, int> warehouseCounts)
+    {
+        var corrections = 0;
+        foreach (var (sku, counted) in warehouseCounts)
+        {
+            var difference = counted - ledger.OnHand(sku);
+            if (difference == 0)
+            {
+                continue;
+            }
+
+            if (difference > 0)
+            {
+                ledger.Receive(sku, difference);
+            }
+            else
+            {
+                ledger.Reserve(sku, -difference);
+            }
+
+            corrections++;
+        }
+
+        return corrections;
+    }
+}

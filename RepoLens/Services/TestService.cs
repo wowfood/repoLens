@@ -13,6 +13,7 @@ internal sealed record TestBatch(
     long DurationMilliseconds,
     IReadOnlyList<TestOutcomeRecord> Outcomes,
     IReadOnlyList<string> Projects,
+    IReadOnlyList<string> ProjectsWithoutResults,
     IReadOnlyList<string> CoverageFiles,
     string? Detail,
     string RawLog);
@@ -113,7 +114,9 @@ internal sealed class TestService(IProcessRunner processRunner)
                 "targeted",
                 config.Tests.CollectCoverage,
                 cancellationToken);
-            var targetedFailed = targeted.State is ExecutionState.Failed or ExecutionState.Unavailable
+            var targetedFailed = targeted.State is ExecutionState.Failed
+                                     or ExecutionState.Unavailable
+                                     or ExecutionState.TimedOut
                                  || targeted.Outcomes.Any(outcome => IsFailed(outcome.Outcome));
             if (plan.Mode == "affected-only" || targetedFailed)
             {
@@ -176,6 +179,7 @@ internal sealed class TestService(IProcessRunner processRunner)
         var outcomes = new Dictionary<string, TestOutcomeRecord>(StringComparer.Ordinal);
         var logs = new List<string>();
         var executedProjects = new List<string>();
+        var projectsWithoutResults = new List<string>();
         var coverageFiles = new List<string>();
         var totalDuration = 0L;
         var state = ExecutionState.Succeeded;
@@ -253,6 +257,7 @@ internal sealed class TestService(IProcessRunner processRunner)
                 .FirstOrDefault();
             if (trxPath is null)
             {
+                projectsWithoutResults.Add(project.Path);
                 continue;
             }
 
@@ -267,6 +272,7 @@ internal sealed class TestService(IProcessRunner processRunner)
             totalDuration,
             outcomes.Values.OrderBy(outcome => outcome.Identity, StringComparer.Ordinal).ToArray(),
             executedProjects.Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.Ordinal).ToArray(),
+            projectsWithoutResults.Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.Ordinal).ToArray(),
             coverageFiles.Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.Ordinal).ToArray(),
             detail,
             string.Join(Environment.NewLine, logs.Where(value => !string.IsNullOrWhiteSpace(value))));
@@ -316,6 +322,10 @@ internal sealed class TestService(IProcessRunner processRunner)
         bool ranFullSuiteAfterTargetedTests,
         bool coverageRequested)
     {
+        // A run is complete only when every attempted project actually reported results. Without
+        // this, a batch in which no project produced a TRX reports Failed = 0 and IsComplete = true,
+        // and the verification delta then finds no regressions in a suite that never ran.
+        var reportedEveryProject = batch.ProjectsWithoutResults.Count == 0;
         return new TestSnapshot
         {
             State = batch.State,
@@ -325,9 +335,12 @@ internal sealed class TestService(IProcessRunner processRunner)
             Skipped = batch.Outcomes.Count(outcome => IsSkipped(outcome.Outcome)),
             DurationMilliseconds = batch.DurationMilliseconds,
             Outcomes = batch.Outcomes,
-            Detail = batch.Detail,
+            Detail = batch.Detail ?? (reportedEveryProject
+                ? null
+                : $"{batch.ProjectsWithoutResults.Count} of {batch.Projects.Count} test project(s) produced no "
+                  + $"test results: {string.Join(", ", batch.ProjectsWithoutResults.Take(5))}."),
             Mode = mode,
-            IsComplete = isComplete,
+            IsComplete = isComplete && reportedEveryProject,
             RanFullSuiteAfterTargetedTests = ranFullSuiteAfterTargetedTests,
             ProjectsExecuted = batch.Projects,
             CoverageRequested = coverageRequested,

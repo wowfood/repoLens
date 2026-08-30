@@ -1,0 +1,87 @@
+[
+  {
+    "name": "order persistence wiring",
+    "query": "order service saves the order through its repository",
+    "expectedFiles": [
+      "src/Ordering/OrderService.cs",
+      "src/Ordering/IOrderRepository.cs",
+      "src/Ordering/OrderRepository.cs"
+    ],
+    "expectedRelationships": [
+      "constructor-parameter: src/Ordering/OrderService.cs -> src/Ordering/IOrderRepository.cs",
+      "constructor-parameter: src/Ordering/OrderService.cs -> src/Inventory/StockLedger.cs"
+    ],
+    "minPrecision": 0.4,
+    "maxTokens": 2000,
+    "maxApproximateTokens": 1800,
+    "maxResults": 10,
+    "graphDepth": 1
+  },
+  {
+    "name": "interface implementation edge",
+    "query": "OrderRepository implements IOrderRepository SaveAsync FindAsync",
+    "expectedFiles": [
+      "src/Ordering/OrderRepository.cs",
+      "src/Ordering/IOrderRepository.cs"
+    ],
+    "expectedRelationships": [
+      "interface-implementation: src/Ordering/OrderRepository.cs -> src/Ordering/IOrderRepository.cs"
+    ],
+    "minPrecision": 0.5,
+    "maxTokens": 2000,
+    "maxApproximateTokens": 1080,
+    "maxResults": 6,
+    "graphDepth": 2
+  },
+  {
+    "name": "stock reservation asked in prose",
+    "query": "how does the warehouse avoid promising more units than it holds",
+    "expectedFiles": ["src/Inventory/StockLedger.cs"],
+    "expectedRelationships": [],
+    "minPrecision": 0.2,
+    "maxTokens": 1600,
+    "maxApproximateTokens": 1000,
+    "maxResults": 8,
+    "graphDepth": 1
+  },
+  {
+    "name": "tests covering order placement",
+    "query": "which tests exercise placing an order",
+    "expectedFiles": [
+      "tests/Ordering.Tests/OrderServiceTests.cs",
+      "src/Ordering/OrderService.cs"
+    ],
+    "expectedRelationships": [],
+    "minPrecision": 0.5,
+    "maxTokens": 1600,
+    "maxApproximateTokens": 1080,
+    "maxResults": 6,
+    "graphDepth": 1
+  },
+  {
+    "name": "single concept exact retrieval",
+    "query": "volume discount threshold",
+    "expectedFiles": ["src/Ordering/PricingCalculator.cs"],
+    "expectedRelationships": [],
+    "minPrecision": 1.0,
+    "expectedSufficiency": "Sufficient",
+    "expectAbstention": false,
+    "maxTokens": 900,
+    "maxApproximateTokens": 430,
+    "maxResults": 4,
+    "graphDepth": 1
+  },
+  {
+    "name": "plausible question about an absent subject",
+    "query": "rotate the TLS certificate used by the ingress controller",
+    "expectedFiles": [],
+    "expectedRelationships": [],
+    "minPrecision": 1.0,
+    "expectedSufficiency": "Insufficient",
+    "expectAbstention": true,
+    "maxTokens": 700,
+    "maxApproximateTokens": 200,
+    "maxResults": 4,
+    "graphDepth": 1
+  }
+]

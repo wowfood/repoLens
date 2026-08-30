@@ -1,0 +1,17 @@
+namespace Ordering;
+
+/// <summary>Turns order lines into an amount payable, including volume discounting.</summary>
+public sealed class PricingCalculator
+{
+    public const decimal VolumeDiscountRate = 0.05m;
+    public const int VolumeDiscountThreshold = 10;
+
+    public decimal Total(IReadOnlyList<OrderLine> lines)
+    {
+        var subtotal = lines.Sum(line => line.UnitPrice * line.Quantity);
+        var units = lines.Sum(line => line.Quantity);
+        return units >= VolumeDiscountThreshold
+            ? decimal.Round(subtotal * (1m - VolumeDiscountRate), 2)
+            : decimal.Round(subtotal, 2);
+    }
+}

@@ -1,5 +1,7 @@
 using System.Reflection;
 using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Xml;
 using DevContext;
 using DevContext.Core;
 using DevContext.Infrastructure;
@@ -137,10 +139,29 @@ internal static class DevContextApplication
             Console.Error.WriteLine("error: operation cancelled.");
             return ExitCodes.UsageOrFailure;
         }
+        // All of these are reachable from ordinary use and used to escape as a raw stack trace.
+        // InvalidDataException is the most likely of them by far: SchemaVersions.EnsureReadable
+        // throws it whenever a baseline was written by a different version of the tool.
         catch (Exception exception) when (exception is
-            IOException or UnauthorizedAccessException or InvalidOperationException or JsonException)
+            IOException
+            or UnauthorizedAccessException
+            or InvalidOperationException
+            or InvalidDataException
+            or JsonException
+            or ArgumentException
+            or XmlException
+            or RegexMatchTimeoutException)
         {
             Console.Error.WriteLine($"error: {exception.Message}");
+
+            // An ArgumentException usually means a defect rather than bad input, so keep the stack
+            // available behind --verbose instead of discarding it with the rest of the noise. Read
+            // from the raw arguments because parsing may be what failed.
+            if (args.Any(argument => argument is "-v" or "--verbose"))
+            {
+                Console.Error.WriteLine(exception.ToString());
+            }
+
             return ExitCodes.UsageOrFailure;
         }
         finally
@@ -249,7 +270,7 @@ internal static class DevContextApplication
     {
         var report = await api.CleanAsync(cancellationToken);
         Write(arguments, report, OutputFormatter.FormatCleanup(report));
-        return report.State is ExecutionState.Failed or ExecutionState.Unavailable
+        return report.State is ExecutionState.Failed or ExecutionState.Unavailable or ExecutionState.TimedOut
             ? ExitCodes.UsageOrFailure
             : ExitCodes.Success;
     }
@@ -364,12 +385,16 @@ internal static class DevContextApplication
                    $"  Recall: {report.MeanFileRecall:P1}{Environment.NewLine}" +
                    $"  Precision: {report.MeanFilePrecision:P1}{Environment.NewLine}" +
                    $"  Approximate tokens: {report.TotalApproximateTokens:N0}{Environment.NewLine}" +
+                   $"  Known gaps (advisory cases not met): {report.AdvisoryFailures}{Environment.NewLine}" +
                    $"  Result: {(report.Passed ? "PASSED" : "FAILED")}{Environment.NewLine}" +
                    string.Join(Environment.NewLine, report.Cases.Select(result =>
-                       $"  - {result.Name}: {(result.Passed ? "PASS" : "FAIL")}, " +
+                       $"  - {result.Name}: " +
+                       $"{(result.FailureReasons.Count == 0 ? "PASS" : result.Advisory ? "KNOWN GAP" : "FAIL")}, " +
                        $"recall {result.FileRecall:P0}, precision {result.FilePrecision:P0}, " +
                        $"evidence {result.Sufficiency}, abstain {(result.ShouldAbstain ? "yes" : "no")}, " +
-                       $"tokens {result.ApproximateTokens:N0}, cold/warm {result.ColdMilliseconds}/{result.WarmMilliseconds} ms")) +
+                       $"tokens {result.ApproximateTokens:N0}, cold/warm {result.ColdMilliseconds}/{result.WarmMilliseconds} ms" +
+                       string.Concat(result.FailureReasons.Select(reason =>
+                           $"{Environment.NewLine}      · {reason}")))) +
                    Environment.NewLine;
         Write(arguments, report, text);
         return report.Passed ? ExitCodes.Success : ExitCodes.BenchmarkAcceptanceFailure;

@@ -14,7 +14,7 @@ design notes remain as the decision record.
 | Tests | 78 passing |
 | Commands | `init`, `baseline`, `status`, `verify`, `affected`, `doctor`, `explain`, `context`, `query`, `refs`, `mcp`, `benchmark`, `report`, `trend`, `schema`, `clean`, `reset` |
 | Configuration | v2 current; v1 is migrated with backward-compatible defaults on `init` or baseline save |
-| Persisted schema | v10, readable window v5–v10; executable manifest fixtures cover every readable version |
+| Persisted schema | v11, readable window v5–v11; executable manifest fixtures cover every readable version |
 | Engine | Solution-aware MSBuild evaluation + Roslyn semantic compilations; gitignore/exclude filtering, commit/ref-aware diffs, bounded parallel indexing, and per-project cache reuse; no LLM or embeddings |
 | CI | `windows-latest`, `ubuntu-latest`, and `macos-latest`; restore, Release build, test, pack API + CLI, net8 consumer, smoke test, retrieval benchmark |
 | Agent integration | Two repository Codex skills under `.agents/skills`, the installable/user-level `start-coding-task` workflow, and a stdio MCP server with seven typed tools |

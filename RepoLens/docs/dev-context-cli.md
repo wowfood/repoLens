@@ -276,38 +276,16 @@ as `query`.
 
 ### `mcp`
 
-Starts a local Model Context Protocol server over standard input/output. The server exposes the
-existing typed API results as structured content through these tools:
-
-- `status` — stored baseline health without running work;
-- `affected` — changed files, impacted declarations/projects, and likely tests;
-- `explain` — project ownership for a path;
-- `context` — bounded change, architecture, build, or risk context;
-- `query` — token-bounded source evidence for a task;
-- `refs` — exact structural reference relationships; and
-- `verify` — an explicit build/test/analyzer regression check.
+Starts a local Model Context Protocol server over standard input/output, exposing the typed API
+results as structured content through nine tools — `baseline`, `status`, `affected`, `query`,
+`refs`, `explain`, `context`, `doctor`, and `verify` — plus the `coding-task` and `ground-question`
+prompts.
 
 `verify` is deliberately not invoked by any read-only tool. It can be slow and writes normal
 build/test artifacts, so an MCP client or agent must choose it explicitly.
 
-A typical MCP client entry is:
-
-```json
-{
-  "mcpServers": {
-    "repolens": {
-      "command": "dev-context",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
-Configure the client to launch the process with the target repository as its working directory.
-The process holds a single `DevContextApi` session and graph in memory across calls. Graph-backed
-tools still recompute the existing deterministic input hash before reuse, so source, project,
-solution, SDK, or configuration changes invalidate stale data. Protocol messages are the only
-content written to standard output; `--verbose` diagnostics remain on standard error.
+See [`agent-setup.md`](agent-setup.md) for client configuration, the tracked `.mcp.json`, payload
+bounds, and the abstention contract an agent has to honour.
 
 ### `benchmark <corpus.json>`
 
@@ -390,6 +368,9 @@ creates it when necessary for backward compatibility. A typical file is:
     "maxSourceFileBytes": 2097152,
     "maxEvidenceFileBytes": 524288,
     "maxEvidenceFilesScanned": 20000
+  },
+  "execution": {
+    "processTimeoutSeconds": 900
   }
 }
 ```
@@ -409,7 +390,16 @@ selected using Git's own ignore rules. `exclude` adds repository-relative globs 
 `respectGitignore` to `false` only when ignored source is intentionally part of the analysis.
 `maxParallelism` bounds concurrent project evaluation and Roslyn indexing work from 1 through 64.
 Its default is the smaller of the machine's processor count and 8, with a minimum of 1; the sample
-shows the maximum default value.
+shows the maximum default value. It is deliberately excluded from the graph cache key: it decides how
+the work is scheduled, never what the resulting graph contains, so including it would give the same
+repository a different cache entry on every machine.
+
+`execution.processTimeoutSeconds` bounds every external command — build, test, Git, formatter, and
+analyzer — from 1 through 86400. A command that overruns it is terminated and reported as `TimedOut`,
+which is distinct from `Failed`: a failed command reached a verdict, a terminated one reached none, so
+`verify` reports an execution failure and exits `2` rather than concluding that nothing regressed. The
+default of 900 seconds is meant to bound a hang, not to police slowness; raise it for a repository
+whose test suite legitimately runs longer.
 
 ## Generated layout
 
@@ -440,6 +430,7 @@ shows the maximum default value.
     dependencies.json
     project-entries/
       <project-path-hash>.json
+  cache.lock
   reports/
     <timestamp>-<purpose>.md
     <timestamp>-<purpose>.trend.json
@@ -448,6 +439,9 @@ shows the maximum default value.
   summary.md
 ```
 
+`cache.lock` exists only while a process is swapping the cache directory into place, and is deleted
+when that process releases it.
+
 Every stored document has a schema version. Schema v10 adds persisted coverage provenance and
 structured retained-report trend points. Schema v9 adds commit-aware change provenance, an
 explicit Git comparison state, solution-scoped multi-language ownership, and structured semantic
@@ -455,7 +449,7 @@ diagnostic summaries. Schema v8 adds evidence sufficiency/abstention,
 relationship origin/framework provenance, exact evidence spans, and local-function symbols.
 Schema v7 adds per-target compilation/reference
 records, generated-source provenance, richer member/markup relationships, and filtered evidence.
-Readers reject schemas outside their declared compatibility window (currently v5-v10). Schema v6 adds resolved metadata-reference provenance,
+Readers reject schemas outside their declared compatibility window (currently v5-v11). Schema v11 adds the timed-out execution state. Schema v6 adds resolved metadata-reference provenance,
 semantic-compilation completeness, source end lines, and evidence bundles. Schema v5 added rich
 source type/member definitions; schema v4 introduced evaluated MSBuild item provenance and richer
 semantic type relationships.
@@ -469,18 +463,26 @@ project items are added, removed, or renamed without unnecessarily hashing large
 Git-ignored paths, configured excludes, generated output, Git internals, IDE state, and
 `.dev-context/` are excluded. On an exact cache miss, matching per-project entries are reused.
 A changed project and its reverse project-reference dependents are rebuilt; independent projects
-remain cached. `doctor` reports the reuse/rebuild counts. Cache entries are replaced atomically.
+remain cached. `doctor` reports the reuse/rebuild counts.
+
+Concurrent callers of one process — overlapping MCP requests, most obviously — share a single graph
+build rather than each running a full evaluation. Between processes, the cache directory is published
+under a `.dev-context/cache.lock` file: the previous directory is renamed aside and replaced, and a
+run that loses the race skips writing the cache rather than failing. The cache only ever makes a
+command faster, so it must never be what makes one fail.
 
 ## Exit codes
 
 - `0`: command completed and verification found no regressions.
 - `1`: verification completed and found regressions.
-- `2`: usage, configuration, repository, or external-command failure.
+- `2`: usage, configuration, repository, or external-command failure, including a command terminated
+  for exceeding `execution.processTimeoutSeconds` and a persisted artifact outside the readable
+  schema window.
 - `3`: `query` or `refs` completed but evidence was insufficient and the result requires abstention.
 - `4`: the retrieval benchmark completed but failed an acceptance criterion.
 
-An unavailable command, a command execution failure, analyzer findings, and a repository
-build/test failure remain separate machine-readable states. In particular, configured analysis
+An unavailable command, a timed-out command, a command execution failure, analyzer findings, and a
+repository build/test failure remain separate machine-readable states. In particular, configured analysis
 that cannot execute makes `verify` return `2`, while successfully produced findings participate in
 the normal baseline delta and return `1` only when they are regressions.
 

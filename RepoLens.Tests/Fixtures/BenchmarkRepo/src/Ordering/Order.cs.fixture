@@ -1,0 +1,8 @@
+namespace Ordering;
+
+public sealed record OrderLine(string Sku, int Quantity, decimal UnitPrice);
+
+public sealed record Order(string OrderId, string CustomerId, IReadOnlyList<OrderLine> Lines)
+{
+    public decimal Total { get; init; }
+}

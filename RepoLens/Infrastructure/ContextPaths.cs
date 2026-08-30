@@ -12,5 +12,11 @@ internal static class ContextPaths
     public static string Summary(string repositoryRoot) => Path.Combine(Root(repositoryRoot), "summary.md");
     public static string Runs(string repositoryRoot) => Path.Combine(Root(repositoryRoot), "runs");
     public static string Cache(string repositoryRoot) => Path.Combine(Root(repositoryRoot), "cache");
+
+    /// <summary>
+    /// Held while the graph cache directory is swapped, so two dev-context processes analyzing the
+    /// same repository cannot delete and rename it underneath one another.
+    /// </summary>
+    public static string CacheLock(string repositoryRoot) => Path.Combine(Root(repositoryRoot), "cache.lock");
     public static string Reports(string repositoryRoot) => Path.Combine(Root(repositoryRoot), "reports");
 }

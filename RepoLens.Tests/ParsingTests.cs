@@ -250,6 +250,73 @@ public sealed class ParsingTests
         }
     }
 
+    [TestMethod]
+    public async Task ProcessRunner_TerminatesACommandThatOverrunsItsTimeout()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"dev-context-timeout-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        try
+        {
+            // Starting a process costs far more than a millisecond on every platform, so this times
+            // out deterministically without needing a command that blocks.
+            var impatient = new ProcessRunner(TimeSpan.FromMilliseconds(1));
+
+            var timedOut = await impatient.RunAsync("dotnet", ["--version"], root, CancellationToken.None);
+
+            Assert.AreEqual(ExecutionState.TimedOut, timedOut.State);
+            Assert.IsNull(timedOut.ExitCode, "A terminated command reached no exit code.");
+            StringAssert.Contains(timedOut.StandardError, "timeout");
+            StringAssert.Contains(timedOut.StandardError, "execution.processTimeoutSeconds");
+
+            var patient = new ProcessRunner(TimeSpan.FromMinutes(2));
+            var succeeded = await patient.RunAsync("dotnet", ["--version"], root, CancellationToken.None);
+
+            Assert.AreEqual(ExecutionState.Succeeded, succeeded.State, succeeded.StandardError);
+            Assert.IsNotEmpty(succeeded.StandardOutput.Trim());
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    [TestMethod]
+    public async Task ProcessRunner_PropagatesCallerCancellationRatherThanReportingATimeout()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"dev-context-cancel-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        using var cancelled = new CancellationTokenSource();
+        await cancelled.CancelAsync();
+        try
+        {
+            // The caller stopping the run and the command overrunning are different events: one is
+            // the user's decision and must propagate, the other is a result the run has to report.
+            await Assert.ThrowsAsync<OperationCanceledException>(() =>
+                new ProcessRunner(TimeSpan.FromMinutes(2))
+                    .RunAsync("dotnet", ["--version"], root, cancelled.Token));
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    [TestMethod]
+    public void Configuration_RejectsAnOutOfRangeProcessTimeout()
+    {
+        Assert.AreEqual(900, new DevContextConfig().Execution.ProcessTimeoutSeconds);
+        ConfigLoader.Validate(new DevContextConfig());
+
+        Assert.Throws<InvalidOperationException>(() => ConfigLoader.Validate(new DevContextConfig
+        {
+            Execution = new ExecutionConfig { ProcessTimeoutSeconds = 0 }
+        }));
+        Assert.Throws<InvalidOperationException>(() => ConfigLoader.Validate(new DevContextConfig
+        {
+            Execution = new ExecutionConfig { ProcessTimeoutSeconds = 86_401 }
+        }));
+    }
+
     private sealed class UnavailableProcessRunner : IProcessRunner
     {
         public Task<ProcessResult> RunAsync(

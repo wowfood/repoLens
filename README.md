@@ -21,7 +21,8 @@ no LLM calls, no embeddings, fully reproducible output.
 
 See [`RepoLens/docs/README.md`](RepoLens/docs/README.md) for the full documentation index,
 including the command reference, API docs, testing procedure, retrieval benchmarks, and release
-readiness criteria.
+readiness criteria. To connect a coding agent, start with
+[`RepoLens/docs/agent-setup.md`](RepoLens/docs/agent-setup.md).
 
 ## Quickstart
 

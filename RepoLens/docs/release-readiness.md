@@ -10,9 +10,14 @@ candidate is ready only when the following gates pass from clean Windows, Linux,
 - `RepoLens.Api` packs as a net8-compatible library and `DevContext.Cli` packs as a .NET tool;
 - a clean net8 console restores, compiles, and runs against the produced API package;
 - the isolated baseline/affected/query/verify smoke test passes;
-- the checked-in evidence corpus retrieves every expected file/relationship within its token
-  ceiling and produces identical output on its repeated warm run; and
+- both evidence corpora — the synthetic fixture repository and this repository — retrieve every
+  expected file and relationship within their token ceilings, meet their precision floors, and
+  produce identical bundles on a warm run and on a run taken after the in-memory graph is dropped;
+- the normalized index dumps from the Windows, Linux, and macOS legs are byte-identical; and
 - `.nupkg` and `.snupkg` files plus the smoke summary are retained as CI artifacts.
+
+Advisory corpus cases are reported as known gaps and do not block a release candidate. They are
+genuine deficiencies, not bookkeeping, and the count belongs in the release notes.
 
 The workflow in `.github/workflows/ci.yml` enforces these gates. Qodana and SonarQube are not
 release requirements.
@@ -21,8 +26,9 @@ release requirements.
 
 - Public API target: .NET 8 or later.
 - CLI target: .NET 10.
-- Current persisted schema: 10.
-- Readable persisted schemas: 5 through 10. Artifacts outside that window fail explicitly.
+- Current persisted schema: 11.
+- Readable persisted schemas: 5 through 11. Artifacts outside that window fail explicitly, with
+  `error: ... uses schema N; this version reads schemas 5-11` and exit 2 rather than a stack trace.
 - Configuration: v2 current, v1 read/migrate supported.
 - CLI/API package version: 0.11.0.
 - MCP transport: stdio through the official C# SDK, exposing typed structured results for the

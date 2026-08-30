@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Collections.Concurrent;
 using System.Text.Json;
 using DevContext.Cli;
+using ModelContextProtocol;
 using ModelContextProtocol.Client;
 
 namespace DevContext.Tests;
@@ -38,9 +39,29 @@ public sealed class CliIntegrationTests
 
             var tools = await client.ListToolsAsync(cancellationToken: timeout.Token);
             CollectionAssert.AreEquivalent(
-                new[] { "status", "affected", "explain", "context", "query", "refs", "verify" },
+                new[]
+                {
+                    "status", "baseline", "doctor", "affected", "explain",
+                    "context", "query", "refs", "verify"
+                },
                 tools.Select(tool => tool.Name).ToArray());
             Assert.IsTrue(tools.All(tool => tool.ProtocolTool.OutputSchema is not null));
+
+            // status, affected, and verify all fail without a baseline, and the remedy for that is a
+            // tool the client can call. Before these existed the only fix was a shell the agent may
+            // not have had.
+            CollectionAssert.IsSubsetOf(
+                new[] { "baseline", "doctor" },
+                tools.Select(tool => tool.Name).ToArray());
+
+            Assert.IsNotNull(client.ServerInstructions);
+            StringAssert.Contains(client.ServerInstructions, "shouldAbstain");
+            StringAssert.Contains(client.ServerInstructions, "refs");
+
+            var prompts = await client.ListPromptsAsync(cancellationToken: timeout.Token);
+            CollectionAssert.AreEquivalent(
+                new[] { "coding-task", "ground-question" },
+                prompts.Select(prompt => prompt.Name).ToArray());
 
             var status = await client.CallToolAsync("status", cancellationToken: timeout.Token);
             Assert.IsFalse(status.IsError ?? false, JsonSerializer.Serialize(status));
@@ -68,6 +89,78 @@ public sealed class CliIntegrationTests
             Assert.AreEqual(
                 "Tracked.cs",
                 explanation.StructuredContent.Value.GetProperty("normalizedPath").GetString());
+
+            const int budget = 512;
+            var evidence = await client.CallToolAsync(
+                "query",
+                new Dictionary<string, object?> { ["query"] = "tracked class", ["maxTokens"] = budget },
+                cancellationToken: timeout.Token);
+            Assert.IsFalse(evidence.IsError ?? false, JsonSerializer.Serialize(evidence));
+            var bundle = evidence.StructuredContent!.Value;
+
+            // The bundle used to carry the rendered prompt and the raw blocks the prompt was built
+            // from, so a 512-token budget shipped roughly 1,024 tokens of excerpt. The excerpts now
+            // appear once, in the prompt; the blocks are reduced to coordinates.
+            Assert.IsLessThanOrEqualTo(budget, bundle.GetProperty("approximateTokens").GetInt32());
+            Assert.IsNotEmpty(bundle.GetProperty("prompt").GetString()!);
+            foreach (var location in bundle.GetProperty("locations").EnumerateArray())
+            {
+                Assert.IsFalse(
+                    location.TryGetProperty("text", out _),
+                    "Evidence locations must not repeat the excerpt the prompt already carries.");
+                Assert.IsGreaterThan(0, location.GetProperty("startLine").GetInt32());
+            }
+
+            var payloadTokens = JsonSerializer.Serialize(bundle).Length / 4;
+            Assert.IsLessThan(
+                budget * 2,
+                payloadTokens,
+                "The whole transported payload must stay near the requested budget, not double it.");
+            Assert.IsTrue(bundle.TryGetProperty("shouldAbstain", out _));
+            Assert.IsTrue(bundle.TryGetProperty("analysisGaps", out _));
+        }
+        finally
+        {
+            DeleteTemporaryDirectory(repository);
+        }
+    }
+
+    [TestMethod]
+    public async Task Mcp_MissingBaseline_ReportsTheRemedyAndCanBeFixedInProtocol()
+    {
+        var repository = CreateTemporaryDirectory();
+        try
+        {
+            var git = await RunProcessAsync("git", ["init", "--quiet"], repository);
+            Assert.AreEqual(0, git.ExitCode, git.StandardError);
+            await File.WriteAllTextAsync(Path.Combine(repository, "Tracked.cs"), "public sealed class Tracked;");
+
+            var transport = new StdioClientTransport(new StdioClientTransportOptions
+            {
+                Name = "RepoLens missing-baseline test",
+                Command = "dotnet",
+                Arguments = [typeof(DevContextApplication).Assembly.Location, "mcp"],
+                WorkingDirectory = repository,
+                ShutdownTimeout = TimeSpan.FromSeconds(1)
+            });
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(120));
+            await using var client = await McpClient.CreateAsync(transport, cancellationToken: timeout.Token);
+
+            // The engine throws for a missing baseline and the remedy it names is a command. Before
+            // the baseline tool existed that remedy was unreachable over the protocol, so an agent
+            // without a shell was simply stuck.
+            var failure = await Assert.ThrowsAsync<McpException>(() =>
+                client.CallToolAsync("status", cancellationToken: timeout.Token).AsTask());
+            StringAssert.Contains(failure.Message, "baseline");
+
+            var created = await client.CallToolAsync(
+                "baseline",
+                cancellationToken: timeout.Token);
+            Assert.IsFalse(created.IsError ?? false, JsonSerializer.Serialize(created));
+
+            var status = await client.CallToolAsync("status", cancellationToken: timeout.Token);
+            Assert.IsFalse(status.IsError ?? false, JsonSerializer.Serialize(status));
+            Assert.IsNotNull(status.StructuredContent);
         }
         finally
         {
@@ -309,6 +402,53 @@ public sealed class CliIntegrationTests
 
             Assert.AreEqual(4, result.ExitCode, result.StandardError);
             StringAssert.Contains(result.StandardOutput, "Result: FAILED");
+        }
+        finally
+        {
+            Directory.Delete(repository, true);
+        }
+    }
+
+    [TestMethod]
+    public async Task BaselineFromAnotherSchemaVersion_ReportsAnErrorInsteadOfAStackTrace()
+    {
+        var repository = CreateTemporaryDirectory();
+        try
+        {
+            var git = await RunProcessAsync("git", ["init", "--quiet"], repository);
+            Assert.AreEqual(0, git.ExitCode, git.StandardError);
+
+            // Opening a baseline written by a different version of the tool is the most likely
+            // user-facing failure there is, and SchemaVersions.EnsureReadable signals it with an
+            // InvalidDataException, which the CLI did not catch.
+            var baseline = Path.Combine(repository, ".dev-context", "baseline");
+            Directory.CreateDirectory(baseline);
+            await File.WriteAllTextAsync(
+                Path.Combine(baseline, "manifest.json"),
+                $$"""
+                {
+                  "schemaVersion": {{DevContext.Core.SchemaVersions.Current + 1}},
+                  "baselineId": "from-the-future",
+                  "createdAtUtc": "2026-01-01T00:00:00+00:00",
+                  "repositoryRoot": "/fixture",
+                  "branch": "main",
+                  "headCommit": "7777777777777777777777777777777777777777",
+                  "workingTreeDirty": false,
+                  "sdkVersion": "10.0.200",
+                  "timings": [],
+                  "repositoryInputHash": "hash",
+                  "repositoryIndexCacheHit": false
+                }
+                """);
+
+            var result = await RunCliAsync(["status"], repository);
+
+            Assert.AreEqual(2, result.ExitCode, result.StandardError);
+            StringAssert.Contains(result.StandardError, "error: ");
+            StringAssert.Contains(result.StandardError, "schema");
+            Assert.IsFalse(
+                result.StandardError.Contains("   at ", StringComparison.Ordinal),
+                $"A recognised failure must not print a stack trace: {result.StandardError}");
         }
         finally
         {
